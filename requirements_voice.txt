@@ -1,0 +1,10 @@
+# Voice pipeline (append to requirements.txt, or install with: pip install -r requirements_voice.txt)
+numpy
+onnxruntime
+websockets
+sounddevice
+faster-whisper
+piper-tts
+sherpa-onnx
+# optional: the nicer-sounding but slower Kokoro voices (EMBER_TTS=kokoro)
+# kokoro-onnx

@@ -1,0 +1,46 @@
+# ---- Secrets — never commit these, no exceptions ----
+.env
+.env.*
+!.env.example
+auth/credentials.json
+auth/token.json
+auth/last_consent.json
+
+# ---- Runtime data, personal state, downloaded models ----
+# Everything under data/ is either a large downloaded model (kokoro,
+# whisper, piper, kws, silero_vad, the embedding cache), a personal
+# database (memory/history/session), or machine-specific cache/state
+# (allowed_paths, app_cache, reminders, files.json, your voice recordings
+# in tune_clips*, your enrolled voiceprint in speaker_profile.json,
+# generated exports). None of it belongs in git.
+data/
+quota_state.json
+mic_check.wav
+
+# Personal facts filed by ember_skills.py — durable behavioral RULES are
+# fine to share (they're generic), but FACTS are personal by design.
+skills/facts/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# ---- Node / Vite / Electron frontend ----
+node_modules/
+dist/
+dist-ssr/
+release/
+out/
+*.local
+
+# ---- Logs / OS / editor cruft ----
+*.log
+logs/
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

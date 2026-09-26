@@ -1,0 +1,138 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #0a0d12;
+  color: #e9edf2;
+  font-family: "Inter", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(225, 113, 47, 0.28);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #1c2430;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #242d3b;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid #e1712f;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+.ember-prose {
+  font-size: 15px;
+  line-height: 1.7;
+  color: #e9edf2;
+}
+.ember-prose > * + * {
+  margin-top: 0.85em;
+}
+.ember-prose h1,
+.ember-prose h2,
+.ember-prose h3 {
+  font-weight: 600;
+  color: #e9edf2;
+  line-height: 1.4;
+}
+.ember-prose h1 {
+  font-size: 1.15em;
+}
+.ember-prose h2 {
+  font-size: 1.08em;
+}
+.ember-prose h3 {
+  font-size: 1em;
+}
+.ember-prose ul,
+.ember-prose ol {
+  padding-left: 1.35em;
+}
+.ember-prose li + li {
+  margin-top: 0.35em;
+}
+.ember-prose a {
+  color: #f2a65a;
+  text-decoration: underline;
+  text-decoration-color: rgba(242, 166, 90, 0.35);
+  text-underline-offset: 2px;
+}
+.ember-prose code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.88em;
+  background: #151b24;
+  border: 1px solid #1c2430;
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+}
+.ember-prose pre {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.85em;
+  background: #10151d;
+  border: 1px solid #1c2430;
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow-x: auto;
+}
+.ember-prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+.ember-prose table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92em;
+}
+.ember-prose th,
+.ember-prose td {
+  border: 1px solid #1c2430;
+  padding: 6px 10px;
+  text-align: left;
+}
+.ember-prose th {
+  color: #7c8798;
+  font-weight: 500;
+}
+.ember-prose blockquote {
+  border-left: 2px solid #242d3b;
+  padding-left: 0.9em;
+  color: #7c8798;
+}

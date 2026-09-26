@@ -1,0 +1,53 @@
+EMBER VOICE BUNDLE
+==================
+Extract this zip INTO your project folder (the one containing ember_core.py) and choose "Replace"
+when Windows asks. Every file below overwrites the file of the same name.
+
+  project root  : ember_core.py  llm_client.py  run_transport.py  ember_transport.py
+                  ember_voice.py  ember_voice_text.py  voice_client.py  voice_tune.py  voice_bench.py
+                  fetch_voice_models.py  requirements_voice.txt
+  tests\        : __init__.py + test_*.py
+
+BEFORE you extract: copy your current ember_core.py and llm_client.py somewhere safe
+(ember_core.py.bak / llm_client.py.bak). They are your uploaded versions with additions;
+if you have edited them since, merge your edits back.
+
+THEN, in a terminal with the venv active, from the project folder:
+
+  pip install -r requirements_voice.txt
+  python fetch_voice_models.py --piper --kws
+  python run_transport.py            (leave it running; wait for "WebSocket server listening")
+
+and in a SECOND terminal:
+
+  python voice_client.py --debug
+
+No token needed: the server generates one the first time and saves it to .env; the client reads it.
+
+TUNE THE WAKE WORD TO YOUR VOICE (about 3 minutes, stop the server first so the mic is free):
+
+  python voice_tune.py --apply
+
+It records you reading ~36 short phrases (saved in data\tune_clips), tests the wake-word detector at
+16 sensitivity settings on your recordings, explains any misses, and saves the best setting to .env.
+Restart the server afterwards. To re-evaluate recordings you already made (no re-recording):
+
+  python voice_tune.py --from-dir data\tune_clips --apply
+
+Also compare Whisper settings on the same recordings (model size, hotword on/off, beam) and see how often
+the two methods together wake her (first use of a model downloads it; ~5 minutes for two models):
+
+  python voice_tune.py --from-dir data\tune_clips --stt base.en small.en --apply
+
+WAKE-WORD SETTINGS (put in .env; all optional):
+  EMBER_WAKE_LOOSE=1            (default) wake on ANYTHING that sounds like "Ember" in the transcript
+                                ("Humba", "Mbo", "Enbow", "Remember," ...). 0 = only exact spellings.
+  EMBER_VAD_THRESHOLD=0.35      hear quieter speech (default 0.5); more noise gets transcribed too
+  EMBER_VAD_MIN_SPEECH_MS=160   keep shorter bursts of speech (default 160)
+  EMBER_KWS_SOFT=0              turn the sound-based "Ember"/"Wake up" detector off
+
+TUNE IN THE PLACE YOU'LL USE IT: record the tuning set where it's noisy, not in a quiet room:
+  python voice_tune.py --dir data\tune_clips_noisy --stt base.en --apply
+
+Optional check (venv active):
+  python -m unittest discover tests      (about 155 tests; a few skip if voice models are missing)
