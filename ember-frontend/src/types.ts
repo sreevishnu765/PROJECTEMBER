@@ -46,7 +46,26 @@ export type ServerMessage =
   | { type: "confirmation_required"; request_id: string; tool_name: string; args: Record<string, unknown> }
   | { type: "query_result"; id: string; ok: true; data: unknown }
   | { type: "query_result"; id: string; ok: false; error: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  // ---- Voice (ember_voice.py / ember_transport.py's voice protocol) ----
+  | { type: "audio_chunk"; data: string; gen: number; sample_rate: number }
+  | { type: "audio_stop"; gen: number }
+  | { type: "voice_duck"; on: boolean }
+  | { type: "voice_state"; state: string; voice_mode: boolean; awake: boolean }
+  | { type: "voice_event"; event: string }
+  | { type: "transcript"; text: string; trigger: string }
+  | { type: "voice_heard"; text: string; verdict: string; stt_s: number; level_db?: number; peak?: number; speech_ratio?: number }
+  | {
+      type: "voice_timing";
+      endpoint_s: number;
+      stt_s: number;
+      turn_start_s: number;
+      first_text_s: number;
+      tts_s: number;
+      total_s: number;
+    }
+  | { type: "voice_warning"; text: string }
+  | { type: "voice_unavailable"; reason: string };
 
 export interface QueryResult<T = unknown> {
   ok: boolean;

@@ -1,12 +1,17 @@
 import { useState } from "react";
 import { Check } from "lucide-react";
-import { PanelHost, PlaceholderNotice } from "./PanelHost";
+import { PanelHost } from "./PanelHost";
 
 const VOICES = ["Heart", "Isabella", "Daniel"] as const;
 type VoiceName = (typeof VOICES)[number];
 const VOICE_STORAGE_KEY = "ember.voicePreference";
 
-export function SettingsPanel({ onClose }: { onClose: () => void }) {
+interface SettingsPanelProps {
+  onClose: () => void;
+  onSelectVoice: (voice: string) => void;
+}
+
+export function SettingsPanel({ onClose, onSelectVoice }: SettingsPanelProps) {
   const [selectedVoice, setSelectedVoice] = useState<VoiceName>(
     () => (localStorage.getItem(VOICE_STORAGE_KEY) as VoiceName) || "Heart",
   );
@@ -14,6 +19,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const selectVoice = (voice: VoiceName) => {
     setSelectedVoice(voice);
     localStorage.setItem(VOICE_STORAGE_KEY, voice);
+    onSelectVoice(voice);
   };
 
   return (
@@ -41,12 +47,6 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             Speed is preset per voice in code — no speed control by design.
           </p>
         </div>
-
-        <PlaceholderNotice>
-          This selection isn't connected to anything yet — Ember doesn't
-          speak until the voice pass is built. Your choice is just
-          remembered here for when it does.
-        </PlaceholderNotice>
       </div>
     </PanelHost>
   );

@@ -1,14 +1,17 @@
 import { useRef, useState, type KeyboardEvent } from "react";
 import { ArrowUp, Mic, Paperclip, Square, Waves } from "lucide-react";
+import type { VoiceStatus } from "../hooks/useEmberChat";
 
 interface ComposerProps {
   disabled: boolean;
   isGenerating: boolean;
   onSend: (text: string) => void;
   onCancel: () => void;
+  voiceStatus: VoiceStatus;
+  onToggleVoice: () => void;
 }
 
-export function Composer({ disabled, isGenerating, onSend, onCancel }: ComposerProps) {
+export function Composer({ disabled, isGenerating, onSend, onCancel, voiceStatus, onToggleVoice }: ComposerProps) {
   const [value, setValue] = useState("");
   const [placeholderNotice, setPlaceholderNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -85,11 +88,20 @@ export function Composer({ disabled, isGenerating, onSend, onCancel }: ComposerP
 
         <button
           type="button"
-          onClick={() => showPlaceholderNotice("Voice input isn't wired up yet.")}
-          title="Voice input — coming soon"
-          className="mb-0.5 shrink-0 rounded-lg p-1.5 text-textMuted transition-colors hover:bg-surfaceRaised hover:text-textSecondary"
+          onClick={onToggleVoice}
+          disabled={disabled}
+          title={voiceStatus.active ? "Turn voice mode off" : "Turn voice mode on"}
+          aria-pressed={voiceStatus.active}
+          className={`relative mb-0.5 shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30 ${
+            voiceStatus.active
+              ? "bg-ember/15 text-ember hover:bg-ember/20"
+              : "text-textMuted hover:bg-surfaceRaised hover:text-textSecondary"
+          }`}
         >
           <Mic size={17} />
+          {voiceStatus.active && voiceStatus.awake && (
+            <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 animate-pulseDot rounded-full bg-statusCloud" />
+          )}
         </button>
 
         {isGenerating ? (

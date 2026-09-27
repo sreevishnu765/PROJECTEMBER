@@ -1,5 +1,4 @@
 import {
-  Boxes,
   Cpu,
   Folder,
   Gauge,
@@ -25,7 +24,6 @@ interface SidebarProps {
 // running list, to keep this sidebar short.
 const NAV_ITEMS: { id: Exclude<PanelId, null>; label: string; icon: typeof History }[] = [
   { id: "history", label: "Past Conversations", icon: History },
-  { id: "projects", label: "Projects", icon: Boxes },
   { id: "memory", label: "Memory", icon: Sparkles },
   { id: "systems", label: "Systems", icon: Cpu },
   { id: "devices", label: "Devices", icon: Laptop2 },
