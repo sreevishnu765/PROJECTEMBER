@@ -234,6 +234,18 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
         t = turn_task
         return t is not None and not t.done()
 
+    def _request_cancel(source: str) -> None:
+        """Cancel only means something while a turn is running. A cancel that
+        arrives with nothing in flight (a stop-button click after the reply
+        finished, a stray "stop") used to leave the flag set, and any cancel
+        that lands a moment into the NEXT turn made that turn answer
+        "Cancelled, sir." for no reason. The log line says who asked, so a
+        spurious cancel can be traced."""
+        active = _turn_active()
+        print(f"[ember_transport] cancel requested by {source} (turn {'active' if active else 'idle - ignored'})")
+        if active:
+            conversation.request_cancel()
+
     def _ensure_voice():
         """Creates this connection's VoiceSession on first use. Returns None
         (and remembers why) if voice can't run on this machine — chat is
@@ -250,7 +262,7 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
             session = VoiceSession(
                 send=_send_threadsafe,
                 submit_turn=_submit_turn_from_voice,
-                cancel_turn=conversation.request_cancel,
+                cancel_turn=lambda: _request_cancel("voice"),
                 turn_active=_turn_active,
                 engines=engines,
             )
@@ -351,7 +363,7 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
             msg_type = msg.get("type")
 
             if msg_type == "cancel":
-                conversation.request_cancel()
+                _request_cancel("client")
                 if voice is not None:
                     voice.interrupt()   # also silences any audio already queued/playing
                 continue

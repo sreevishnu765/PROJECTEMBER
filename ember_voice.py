@@ -63,8 +63,11 @@ is enrolled (see enroll_speaker.py), a genuine wake — "hey Ember", a bare
 "Ember"/"wake up", or a trailing "...Ember" — is only honored if the
 speaker's voiceprint matches the enrolled owner (see the SpeakerVerifier
 section below for the fail-open contract on missing models/profiles).
-This does NOT gate the stop phrases above (acoustic or transcribed), or
-continuations inside an already-open voice-mode/follow-up window.
+This does NOT gate the stop phrases above (acoustic or transcribed). It DOES
+gate continuations inside voice mode / a follow-up window once a profile is
+enrolled (see _speaker_ok_continuation): the desktop app's mic button turns
+voice mode on permanently, so without this any audio in the room (a video,
+another person) would be accepted as a command.
 
 Wire protocol (JSON over the existing WebSocket; mic audio is binary)
 ---------------------------------------------------------------------
@@ -619,9 +622,11 @@ class WakeStream:
 # contract (transcript matching if the acoustic model is missing) rather
 # than turning a missing optional model into a hard failure.
 #
-# Deliberately NOT applied to: voice-mode / follow-up continuations (once a
-# genuine wake has opened the window, anyone can finish that one exchange —
-# tightening that further is future scope, not this pass), or the
+# Also applied to voice-mode / follow-up continuations (see
+# _speaker_ok_continuation) — stricter there: once enrolled, a clip too short
+# to embed is refused rather than failing open, since voice mode is always
+# awake and would otherwise let any short ambient line through. Deliberately
+# NOT applied to the
 # half-duplex "stop" interrupt in _handle_deaf_utterance (that clip is
 # usually well under a second — too short to embed reliably — and a
 # spurious stop from a stranger's voice is a cheap, instantly-recoverable
@@ -1279,6 +1284,21 @@ class VoiceSession:
         fail-open contract."""
         return self._speaker.matches(audio) is not False
 
+    def _speaker_ok_continuation(self, audio: "np.ndarray | None", text: str) -> bool:
+        """Speaker gate for voice-mode / follow-up utterances (no wake phrase involved).
+        Not enrolled -> always True (opt-in, same as wake). Enrolled -> a confident
+        mismatch is refused, AND so is a clip too short/quiet to embed ("can't tell"),
+        because voice mode is permanently awake: failing open here is exactly how a
+        video's short lines got through. Stop commands are exempt (cheap, recoverable,
+        usually under the embedding minimum). EMBER_SPEAKER_STRICT_SHORT=0 restores
+        fail-open for short clips."""
+        if not self._speaker.enrolled or is_stop_command(text):
+            return True
+        result = self._speaker.matches(audio)
+        if result is None:
+            return os.environ.get("EMBER_SPEAKER_STRICT_SHORT", "1") == "0"
+        return result
+
     def _refresh_state(self, force: bool = False) -> None:
         now = self._clock()
         turn_active = bool(self._turn_active())   # transport callback — never call it while holding our lock
@@ -1767,6 +1787,9 @@ class VoiceSession:
         if wake_matched and not self._speaker_ok(full_audio):
             self._report(text, f"ignored ({trigger}{', ' + acoustic_label if acoustic else ''}, not enrolled voice)")
             return
+        if trigger in ("voice_mode", "follow_up") and not self._speaker_ok_continuation(full_audio, text):
+            self._report(text, f"ignored ({trigger}, not enrolled voice)")
+            return
 
         self._report(text, f"accepted ({trigger}{', ' + acoustic_label if acoustic else ''})")
         if wake_matched:
@@ -1798,6 +1821,14 @@ class VoiceSession:
             return
 
         busy = self._is_speaking() or self._turn_active()
+        if not busy and is_stop_command(command):
+            # Nothing running: don't send "stop" to the LLM as a chat turn (she'd answer "Nothing's
+            # actively running..."). Still flush the client, whose audio queue can outlast the
+            # server's estimate of when she stopped talking.
+            self._log(f"stop ({trigger}) while idle - ignored, flushing client audio")
+            self.interrupt()
+            self._send({"type": "voice_event", "event": "stopped"})
+            return
         if busy and is_stop_command(command):
             self._log(f"stop ({trigger})")
             self.interrupt()

@@ -202,6 +202,22 @@ export class VoicePlaybackQueue {
     this.scheduled = [];
   }
 
+  /** Instantly silences what's queued/playing WITHOUT raising the stale-chunk
+   * floor (unlike flush(gen), which needs the server's generation number).
+   * For a local stop click: audible right away; the server's audio_stop that
+   * follows then sets the real floor for chunks still in flight. */
+  silenceNow(): void {
+    this.nextStartTime = this.audioContext.currentTime;
+    for (const source of this.scheduled) {
+      try {
+        source.stop();
+      } catch {
+        // already finished
+      }
+    }
+    this.scheduled = [];
+  }
+
   setDucked(ducked: boolean): void {
     this.gainNode.gain.setTargetAtTime(ducked ? 0.25 : 1.0, this.audioContext.currentTime, 0.05);
   }

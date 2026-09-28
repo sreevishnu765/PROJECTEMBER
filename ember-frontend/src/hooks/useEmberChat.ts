@@ -6,11 +6,13 @@ import { startMicCapture, VoicePlaybackQueue, type MicCapture } from "../lib/voi
 const URL_STORAGE_KEY = "ember.serverUrl";
 const TOKEN_STORAGE_KEY = "ember.token";
 const VOICE_STORAGE_KEY = "ember.voicePreference"; // same key SettingsPanel already writes to
+const AUTO_LISTEN_KEY = "ember.autoListen"; // "0" = user muted the mic; anything else = listen for the wake word on connect
 
 // Mirrors ember_voice.py's own {"type":"voice_state",...} shape. `active`
-// is the one thing the button actually cares about — mic capture and
-// voice mode are toggled TOGETHER as a single concept here (one button,
-// one state), not exposed as two independently-toggleable things.
+// now means "mic is capturing and the server is listening for the wake
+// word" — independent of `voiceMode` (always-awake, no wake word needed).
+// The mic starts automatically on connect; the mic button only toggles
+// voiceMode.
 export type VoiceStatus = {
   active: boolean;
   state: string | null;
@@ -54,6 +56,7 @@ export function useEmberChat() {
   // when sending, resolved when a "query_result" with the matching id
   // comes back. Separate from the chat message flow entirely; a panel
   // query never touches `messages` or the visible chat.
+  const startListeningRef = useRef<(auto: boolean) => Promise<boolean>>(async () => false);
   const pendingQueriesRef = useRef<Map<string, (result: QueryResult) => void>>(new Map());
 
   const updateAssistant = useCallback((id: string, patch: Partial<ChatMessage>) => {
@@ -71,6 +74,10 @@ export function useEmberChat() {
           const savedVoice = localStorage.getItem(VOICE_STORAGE_KEY);
           if (savedVoice) {
             wsRef.current?.send(JSON.stringify({ type: "voice", action: "voice", name: savedVoice.toLowerCase() }));
+          }
+          // Wake-word listening no longer waits for a button click.
+          if (localStorage.getItem(AUTO_LISTEN_KEY) !== "0") {
+            void startListeningRef.current(true);
           }
           break;
         }
@@ -151,7 +158,7 @@ export function useEmberChat() {
 
         // ---- Voice: status/events ------------------------------------------
         case "voice_state":
-          setVoiceStatus((prev) => ({ ...prev, state: msg.state, voiceMode: msg.voice_mode, awake: msg.awake }));
+          setVoiceStatus((prev) => ({ ...prev, state: msg.state, voiceMode: msg.voice_mode, awake: msg.awake, speaking: msg.state === "speaking" }));
           break;
         case "voice_event":
           setVoiceStatus((prev) => ({
@@ -306,23 +313,14 @@ export function useEmberChat() {
     socket.send(JSON.stringify({ type: "voice", action, ...extra }));
   }, []);
 
-  /** The one voice button's entire job: mic capture and voice mode are a
-   * single combined state here, not two independent toggles — clicking
-   * turns both on together, clicking again turns both off. Call this from
-   * a real user click; browsers/Electron require a user gesture to grant
-   * mic access and unsuspend an AudioContext. */
-  const toggleVoiceMode = useCallback(async () => {
+  /** Starts mic capture + server-side wake-word listening. Voice mode is NOT
+   * touched. `auto` = called on connect with no user gesture: a failure
+   * (mic permission, autoplay policy) is logged quietly instead of shown as
+   * an error, and the mic button can still start it later from a real click. */
+  const startListening = useCallback(async (auto: boolean): Promise<boolean> => {
     const socket = wsRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-
-    if (voiceStatus.active) {
-      micRef.current?.stop();
-      micRef.current = null;
-      sendVoiceControl("listen", { on: false });
-      sendVoiceControl("mode", { on: false });
-      setVoiceStatus((prev) => ({ ...prev, active: false, voiceMode: false }));
-      return;
-    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    if (micRef.current) return true;
 
     if (!playbackRef.current) playbackRef.current = new VoicePlaybackQueue();
     playbackRef.current.resume();
@@ -332,19 +330,53 @@ export function useEmberChat() {
         if (socket.readyState === WebSocket.OPEN) socket.send(frame);
       });
     } catch (e) {
-      setLastError(e instanceof Error ? `Couldn't access the microphone: ${e.message}` : "Couldn't access the microphone.");
-      return;
+      const text = e instanceof Error ? `Couldn't access the microphone: ${e.message}` : "Couldn't access the microphone.";
+      if (auto) console.warn("[ember voice] auto-listen failed:", text);
+      else setLastError(text);
+      return false;
     }
 
+    localStorage.removeItem(AUTO_LISTEN_KEY);
     sendVoiceControl("listen", { on: true });
-    sendVoiceControl("mode", { on: true });
     // Real echo cancellation is available here (getUserMedia's
     // echoCancellation constraint, unlike the raw Python voice_client.py)
-    // — safe to ask for genuine barge-in instead of the half-duplex/
-    // acoustic-stop-keyword workaround the raw client needs.
+    // — safe to ask for genuine barge-in.
     sendVoiceControl("barge_in", { on: true });
-    setVoiceStatus((prev) => ({ ...prev, active: true, voiceMode: true }));
-  }, [voiceStatus.active, sendVoiceControl]);
+    setVoiceStatus((prev) => ({ ...prev, active: true }));
+    return true;
+  }, [sendVoiceControl]);
+
+  useEffect(() => {
+    startListeningRef.current = startListening;
+  }, [startListening]);
+
+  /** Fully mutes the mic (also turns voice mode off, and remembers the
+   * choice so the mic doesn't come back on at next launch). */
+  const stopListening = useCallback(() => {
+    micRef.current?.stop();
+    micRef.current = null;
+    localStorage.setItem(AUTO_LISTEN_KEY, "0");
+    sendVoiceControl("listen", { on: false });
+    sendVoiceControl("mode", { on: false });
+    setVoiceStatus((prev) => ({ ...prev, active: false, voiceMode: false, awake: false }));
+  }, [sendVoiceControl]);
+
+  const toggleListening = useCallback(async () => {
+    if (micRef.current) stopListening();
+    else await startListening(false);
+  }, [startListening, stopListening]);
+
+  /** The mic button: toggles voice mode (always awake, no wake word). If the
+   * mic isn't running yet it's started first. Call from a real user click. */
+  const toggleVoiceMode = useCallback(async () => {
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!micRef.current && !(await startListening(false))) return;
+
+    const next = !voiceStatus.voiceMode;
+    sendVoiceControl("mode", { on: next });
+    setVoiceStatus((prev) => ({ ...prev, voiceMode: next }));
+  }, [voiceStatus.voiceMode, startListening, sendVoiceControl]);
 
   const setVoiceName = useCallback((name: string) => sendVoiceControl("voice", { name: name.toLowerCase() }), [sendVoiceControl]);
   const setSpeakerEnabled = useCallback((on: boolean) => sendVoiceControl("speaker", { on }), [sendVoiceControl]);
@@ -353,11 +385,12 @@ export function useEmberChat() {
    * (feels instant) and tells the server too, so a still-running turn
    * actually cancels rather than just muting this client's audio. */
   const stopSpeaking = useCallback(() => {
-    playbackRef.current?.flush(Number.MAX_SAFE_INTEGER);
+    playbackRef.current?.silenceNow(); // instant, no server round trip
     setVoiceStatus((prev) => ({ ...prev, speaking: false }));
-    sendVoiceControl("stop");
+    // One message is enough: the server's "cancel" both silences voice and
+    // cancels a running turn (only if one is actually running).
     cancelGeneration();
-  }, [sendVoiceControl, cancelGeneration]);
+  }, [cancelGeneration]);
 
   const QUERY_TIMEOUT_MS = 10000;
 
@@ -430,6 +463,7 @@ export function useEmberChat() {
     respondConfirmation,
     clearConversation,
     toggleVoiceMode,
+    toggleListening,
     setVoiceName,
     setSpeakerEnabled,
     stopSpeaking,

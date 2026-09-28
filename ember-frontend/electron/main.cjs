@@ -26,6 +26,10 @@ const isDev = !app.isPackaged;
 
 Menu.setApplicationMenu(null);
 
+// Mic capture now starts automatically on connect (wake-word listening), so
+// there is no click to unlock audio playback — allow it without a gesture.
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
 // ---- Backend config -------------------------------------------------
 // Overridable without touching code: create ember-frontend/ember.config.json
 // with either/both fields to point at a real venv interpreter or a backend

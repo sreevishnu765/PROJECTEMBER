@@ -227,10 +227,11 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(r.cancelled, 1)
         self.assertTrue(r.of("voice_event", event="stopped"))
 
-    def test_stop_when_idle_passes_through(self):
+    def test_stop_when_idle_is_ignored_but_flushes_client(self):
         r = self.r
         r.say("Ember, stop")
-        self.assertEqual(r.submitted, ["stop"])   # nothing running: normal pipeline answers it
+        self.assertEqual(r.submitted, [])   # nothing running: not sent to the LLM as a chat turn
+        self.assertTrue(r.of("audio_stop"))   # but any lingering client audio is flushed
 
     def test_own_speech_echo_is_dropped_in_voice_mode(self):
         r = self.r

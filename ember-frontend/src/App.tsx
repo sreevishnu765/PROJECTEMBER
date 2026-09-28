@@ -32,10 +32,11 @@ export default function App() {
     connect,
     sendMessage,
     sendQuery,
-    cancelGeneration,
+    stopSpeaking,
     respondConfirmation,
     clearConversation,
     toggleVoiceMode,
+    toggleListening,
     setVoiceName,
   } = useEmberChat();
 
@@ -148,9 +149,10 @@ export default function App() {
           disabled={connectionState !== "connected"}
           isGenerating={isGenerating}
           onSend={sendMessage}
-          onCancel={cancelGeneration}
+          onCancel={stopSpeaking}
           voiceStatus={voiceStatus}
           onToggleVoice={toggleVoiceMode}
+          onToggleListening={toggleListening}
         />
       </div>
 

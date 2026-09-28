@@ -1,5 +1,5 @@
 import { useRef, useState, type KeyboardEvent } from "react";
-import { ArrowUp, Mic, Paperclip, Square, Waves } from "lucide-react";
+import { ArrowUp, Ear, EarOff, Mic, Paperclip, Square, Waves } from "lucide-react";
 import type { VoiceStatus } from "../hooks/useEmberChat";
 
 interface ComposerProps {
@@ -9,9 +9,10 @@ interface ComposerProps {
   onCancel: () => void;
   voiceStatus: VoiceStatus;
   onToggleVoice: () => void;
+  onToggleListening: () => void;
 }
 
-export function Composer({ disabled, isGenerating, onSend, onCancel, voiceStatus, onToggleVoice }: ComposerProps) {
+export function Composer({ disabled, isGenerating, onSend, onCancel, voiceStatus, onToggleVoice, onToggleListening }: ComposerProps) {
   const [value, setValue] = useState("");
   const [placeholderNotice, setPlaceholderNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -88,27 +89,38 @@ export function Composer({ disabled, isGenerating, onSend, onCancel, voiceStatus
 
         <button
           type="button"
+          onClick={onToggleListening}
+          disabled={disabled}
+          title={voiceStatus.active ? "Listening for \"Hey Ember\" — click to mute" : "Mic muted — click to listen for the wake word"}
+          aria-pressed={!voiceStatus.active}
+          className="mb-0.5 shrink-0 rounded-lg p-1.5 text-textMuted transition-colors hover:bg-surfaceRaised hover:text-textSecondary disabled:opacity-30"
+        >
+          {voiceStatus.active ? <Ear size={17} /> : <EarOff size={17} />}
+        </button>
+
+        <button
+          type="button"
           onClick={onToggleVoice}
           disabled={disabled}
-          title={voiceStatus.active ? "Turn voice mode off" : "Turn voice mode on"}
-          aria-pressed={voiceStatus.active}
+          title={voiceStatus.voiceMode ? "Turn voice mode off" : "Turn voice mode on (no wake word needed)"}
+          aria-pressed={voiceStatus.voiceMode}
           className={`relative mb-0.5 shrink-0 rounded-lg p-1.5 transition-colors disabled:opacity-30 ${
-            voiceStatus.active
+            voiceStatus.voiceMode
               ? "bg-ember/15 text-ember hover:bg-ember/20"
               : "text-textMuted hover:bg-surfaceRaised hover:text-textSecondary"
           }`}
         >
           <Mic size={17} />
-          {voiceStatus.active && voiceStatus.awake && (
+          {voiceStatus.voiceMode && voiceStatus.awake && (
             <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 animate-pulseDot rounded-full bg-statusCloud" />
           )}
         </button>
 
-        {isGenerating ? (
+        {isGenerating || voiceStatus.speaking ? (
           <button
             onClick={onCancel}
             className="mb-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surfaceRaised text-textPrimary hover:bg-borderLight"
-            aria-label="Stop generating"
+            aria-label="Stop"
           >
             <Square size={13} fill="currentColor" />
           </button>
