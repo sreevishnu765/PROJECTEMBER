@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChatMessage, ConnectionState, PendingConfirmation, QueryResult, ServerMessage } from "../types";
+import type { ChatMessage, ConnectionState, OutgoingAttachment, PendingConfirmation, QueryResult, ServerMessage } from "../types";
+import { encodeFiles } from "../lib/attachments";
 import { isGroundedTag, parseProviderFamily } from "../lib/providerTag";
 import { startMicCapture, VoicePlaybackQueue, type MicCapture } from "../lib/voiceAudio";
 
@@ -273,14 +274,29 @@ export function useEmberChat() {
     [handleServerMessage],
   );
 
-  const sendMessage = useCallback((text: string) => {
+  const sendMessage = useCallback(async (text: string, files: File[] = []) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+    let attachments: OutgoingAttachment[] = [];
+    if (files.length > 0) {
+      try {
+        attachments = await encodeFiles(files);
+      } catch {
+        setLastError("Couldn't read one of the attached files.");
+        return;
+      }
+    }
+    // Re-check: the socket can close while a large file is being encoded.
     const socket = wsRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    const names = files.map((file) => file.name).join(", ");
+    const shown = files.length > 0 ? `${text.trim()}${text.trim() ? "  " : ""}\u{1F4CE} ${names}` : text;
 
     const userMsg: ChatMessage = {
       id: makeId(),
       role: "user",
-      content: text,
+      content: shown,
       statusLine: null,
       tag: null,
       providerFamily: null,
@@ -288,6 +304,7 @@ export function useEmberChat() {
       error: null,
       pending: false,
     };
+
     const assistantId = makeId();
     const assistantMsg: ChatMessage = {
       id: assistantId,
@@ -300,10 +317,12 @@ export function useEmberChat() {
       error: null,
       pending: true,
     };
+
     currentAssistantIdRef.current = assistantId;
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setIsGenerating(true);
-    socket.send(JSON.stringify({ type: "message", text }));
+
+    socket.send(JSON.stringify({ type: "message", text, ...(attachments.length > 0 ? { attachments } : {}) }));
   }, []);
 
   const cancelGeneration = useCallback(() => {

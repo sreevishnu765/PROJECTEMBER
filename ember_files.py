@@ -84,6 +84,63 @@ class FileRegistry:
             self._save_locked()
         return entry
 
+    def update_path(self, old: str, new: str) -> int:
+        """A file Ember knows about was moved/renamed: point its entries at the new
+        location (and refresh the label) instead of leaving a dead path in the panel."""
+        changed = 0
+        with self._lock:
+            for e in self._entries:
+                if e.get("path") and os.path.normcase(e["path"]) == os.path.normcase(old):
+                    e["path"] = new
+                    e["label"] = os.path.basename(new)
+                    changed += 1
+            if changed:
+                self._save_locked()
+        return changed
+
+    def remove_path(self, path: str) -> int:
+        """A file Ember knew about was deleted: drop its entries."""
+        with self._lock:
+            before = len(self._entries)
+            self._entries = [e for e in self._entries if not (e.get("path") and os.path.normcase(e["path"]) == os.path.normcase(path))]
+            removed = before - len(self._entries)
+            if removed:
+                self._save_locked()
+        return removed
+
+    @staticmethod
+    def _norm(p: str) -> str:
+        return os.path.normcase(os.path.normpath(p))
+
+    def update_prefix(self, old_dir: str, new_dir: str) -> int:
+        """A FOLDER was moved/renamed: every recorded file that lived inside it follows."""
+        old_n = self._norm(old_dir) + os.sep
+        changed = 0
+        with self._lock:
+            for e in self._entries:
+                p = e.get("path")
+                if p and (self._norm(p) + os.sep).startswith(old_n):
+                    e["path"] = os.path.join(new_dir, os.path.relpath(self._norm(p), self._norm(old_dir)))
+                    changed += 1
+            if changed:
+                self._save_locked()
+        return changed
+
+    def remove_prefix(self, dir_path: str) -> int:
+        """A FOLDER was deleted: drop every recorded file that lived inside it."""
+        old_n = self._norm(dir_path) + os.sep
+        with self._lock:
+            before = len(self._entries)
+            self._entries = [e for e in self._entries if not (e.get("path") and (self._norm(e["path"]) + os.sep).startswith(old_n))]
+            removed = before - len(self._entries)
+            if removed:
+                self._save_locked()
+        return removed
+
+    def get(self, entry_id: str) -> "dict | None":
+        with self._lock:
+            return next((dict(e) for e in self._entries if e.get("id") == entry_id), None)
+
     def list_all(self, kind: "str | None" = None) -> "list[dict]":
         with self._lock:
             entries = list(self._entries)

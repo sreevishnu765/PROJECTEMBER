@@ -1139,6 +1139,8 @@ class StreamChunk:
     source: "str | None" = None   # only set on the final chunk
     model: "str | None" = None    # only set on the final chunk
     error: "str | None" = None    # set if the stream ended on failure, partial or total
+    recovered_from: "str | None" = None  # set on the final chunk when a mid-stream failure was healed by
+                                          # continuing on another tier; holds the ORIGINAL error text (for logs)
 
 
 def _stream_gemini(model: str, prompt: str, system_prompt: str, history: "list | None"):
@@ -1238,12 +1240,94 @@ def _stream_local(prompt: str, system_prompt: str, history: "list | None"):
             break
 
 
+
+# ---- Mid-stream recovery ---------------------------------------------------
+# Real failure that motivated this: Gemini returned 504 DEADLINE_EXCEEDED halfway
+# through a streamed reply. The old rule ("never switch tiers once text has been
+# shown") left the user with a truncated answer plus a raw error blob that was then
+# saved into history, so the model itself started talking about "a server timeout".
+#
+# New rule: when a tier dies AFTER showing text, hand the next available tier the
+# original request plus the partial answer and ask it to continue from exactly that
+# point. The continuation is stitched on seamlessly (its first ~160 chars are held
+# back briefly so a repeated tail can be trimmed off). Bounded: at most
+# MAX_CONTINUATIONS recovery hops per reply, never back onto a tier that already
+# failed this reply. Only if every remaining tier also fails does the caller get
+# the original interruption error, as before.
+#
+# Known limit: a continuation is a different model picking up mid-thought, so
+# tone can shift slightly at the seam, and a model that ignores the instruction and
+# restarts from the top is only caught when it repeats the tail of the partial.
+MAX_CONTINUATIONS = 2
+_OVERLAP_HOLD_CHARS = 160
+_MIN_OVERLAP = 5
+
+CONTINUATION_SYSTEM_NOTE = (
+    "You are resuming a reply that was cut off by a connection error. Output ONLY the "
+    "remaining text. Never repeat text that was already written, never restart, and "
+    "never mention the interruption or apologise."
+)
+
+
+def _continuation_prompt(original_prompt: str, partial: str) -> str:
+    return (
+        f"{original_prompt}\n\n"
+        "[Your reply to the above was cut off. This is everything already shown to the user:]\n"
+        f"<<<\n{partial}\n>>>\n"
+        "Continue from exactly where it stops, starting with the very next word."
+    )
+
+
+def _overlap_len(tail: str, head: str) -> int:
+    """How many leading chars of `head` duplicate the end of `tail` (0 if the
+    overlap is too short to be trustworthy). Also tolerates the model having
+    stripped leading whitespace; the return value is always in `head` chars."""
+    for cand in (head, head.lstrip()):
+        stripped = len(head) - len(cand)
+        for k in range(min(len(tail), len(cand), 200), _MIN_OVERLAP - 1, -1):
+            if tail.endswith(cand[:k]):
+                return stripped + k
+    return 0
+
+
+class _OverlapTrimmer:
+    """Holds the first ~_OVERLAP_HOLD_CHARS of a continuation, trims any repeat of
+    what was already shown, restores a word boundary the model may have stripped,
+    then passes everything after that straight through."""
+
+    def __init__(self, already_shown: str):
+        self.tail = already_shown[-200:]
+        self.buf = ""
+        self.released = False
+
+    def feed(self, delta: str) -> str:
+        if self.released:
+            return delta
+        self.buf += delta
+        return self._release() if len(self.buf) >= _OVERLAP_HOLD_CHARS else ""
+
+    def flush(self) -> str:
+        return "" if self.released else self._release()
+
+    def _release(self) -> str:
+        self.released = True
+        text, self.buf = self.buf, ""
+        cut = _overlap_len(self.tail, text)
+        if cut:
+            return text[cut:]
+        if self.tail and text and self.tail[-1].isalnum() and text[0].isalnum():
+            return " " + text
+        return text
+
+
 def generate_stream(
     prompt: str,
     system_prompt: str = "",
     use_search: bool = False,
     history: "list | None" = None,
     cancel_check=None,
+    _exclude=frozenset(),
+    _continuations_left: int = MAX_CONTINUATIONS,
 ):
     """Streaming counterpart to generate() — yields StreamChunk objects
     instead of returning one GenerateResult. Same tier order and quota
@@ -1265,6 +1349,48 @@ def generate_stream(
 
     t_start = time.perf_counter()
     history = history or []
+
+    def _recover(partial_text: str, err_chunk):
+        """Continue a reply on another tier after a mid-stream failure (see the
+        "Mid-stream recovery" note above). Yields the stitched continuation, or the
+        original error chunk if no other tier can take over."""
+        import dataclasses
+        print(f"[llm_client] {err_chunk.model} died mid-reply ({err_chunk.error}); continuing on another tier.")
+        cont_system = (f"{system_prompt}\n\n" if system_prompt else "") + CONTINUATION_SYSTEM_NOTE
+        trimmer = _OverlapTrimmer(partial_text)
+        try:
+            for c in generate_stream(
+                _continuation_prompt(prompt, partial_text),
+                system_prompt=cont_system, use_search=False, history=history, cancel_check=cancel_check,
+                _exclude=frozenset(_exclude) | {err_chunk.model},
+                _continuations_left=_continuations_left - 1,
+            ):
+                if c.text_delta:
+                    out = trimmer.feed(c.text_delta)
+                    if out:
+                        yield StreamChunk(text_delta=out)
+                    continue
+                tail = trimmer.flush()
+                if tail:
+                    yield StreamChunk(text_delta=tail)
+                if not c.error and not c.cancelled:
+                    c = dataclasses.replace(c, recovered_from=err_chunk.error)
+                    print(f"[llm_client] reply recovered: continued on {c.model}.")
+                yield c
+                return
+        except Exception as e:
+            print(f"[llm_client] recovery could not start on any other tier ({e}).")
+        yield err_chunk  # nothing (more) could be done: surface the original interruption
+
+    def _recovering(chunk_generator):
+        partial = []
+        for chunk in chunk_generator:
+            if chunk.done and chunk.error and not chunk.cancelled and partial and _continuations_left > 0:
+                yield from _recover("".join(partial), chunk)
+                return
+            if chunk.text_delta:
+                partial.append(chunk.text_delta)
+            yield chunk
 
     def _run_tier(chunk_generator, source: str, model: str):
         started = False
@@ -1298,10 +1424,10 @@ def generate_stream(
     if cloud_available():
         for tier in CLOUD_TIERS:
             model = tier["model"]
-            if not _quota.can_use(model):
+            if not _quota.can_use(model) or model in _exclude:
                 continue
             try:
-                gen = _run_tier(_stream_gemini(model, prompt, system_prompt, history), "cloud", model)
+                gen = _recovering(_run_tier(_stream_gemini(model, prompt, system_prompt, history), "cloud", model))
                 first = next(gen)
                 _quota.record(model)
                 print(f"[llm_client] {model}: first token in {time.perf_counter() - t_start:.1f}s")
@@ -1315,13 +1441,13 @@ def generate_stream(
                 continue
 
     for tier in FALLBACK_TIERS:
-        if not _tier_has_key(tier):
+        if not _tier_has_key(tier) or f"{tier['name']}:{tier['model']}" in _exclude:
             continue
         if tier["rpd"] is not None and not _quota.can_use(tier["model"]):
             continue
         try:
             model_tag = f"{tier['name']}:{tier['model']}"
-            gen = _run_tier(_stream_openai_compatible(tier, prompt, system_prompt, history), "fallback", model_tag)
+            gen = _recovering(_run_tier(_stream_openai_compatible(tier, prompt, system_prompt, history), "fallback", model_tag))
             first = next(gen)
             print(f"[llm_client] {tier['name']}: first token in {time.perf_counter() - t_start:.1f}s")
             if tier["rpd"] is not None:
@@ -1335,8 +1461,10 @@ def generate_stream(
             print(f"[llm_client] {tier['name']} streaming failed before any output ({e}); trying next option.")
             continue
 
+    if OLLAMA_MODEL in _exclude:
+        raise RuntimeError("Every other tier failed to stream, and local already failed this reply.")
     try:
-        gen = _run_tier(_stream_local(prompt, system_prompt, history), "local", OLLAMA_MODEL)
+        gen = _recovering(_run_tier(_stream_local(prompt, system_prompt, history), "local", OLLAMA_MODEL))
         first = next(gen)
         yield first
         yield from gen

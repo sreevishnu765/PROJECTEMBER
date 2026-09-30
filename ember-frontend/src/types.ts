@@ -40,6 +40,13 @@ export interface ChatMessage {
   pending: boolean;
 }
 
+/** One file attached in the composer, as sent over the WebSocket (base64, no data: prefix). */
+export interface OutgoingAttachment {
+  name: string;
+  mime: string;
+  data: string;
+}
+
 export interface PendingConfirmation {
   requestId: string;
   toolName: string;
@@ -117,7 +124,7 @@ export interface MemoryRow {
 export interface FileEntry {
   id: string;
   kind: "upload" | "generated";
-  category: "analyzed" | "pdf_export" | "drive_download";
+  category: "analyzed" | "attached" | "pdf_export" | "drive_download";
   path: string | null;
   label: string;
   created_at: number;

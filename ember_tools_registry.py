@@ -68,6 +68,7 @@ class Tool:
     pattern: "re.Pattern"      # compiled regex; dispatch() tries these in registration order
     handler: ToolHandler
     destructive: bool = False  # if True, routes through ember_confirmation before handler runs
+    guard: "Callable[[re.Match], bool] | None" = None  # optional veto: a regex hit only counts if guard(match) is True
 
 
 class ToolRegistry:
@@ -82,13 +83,14 @@ class ToolRegistry:
         handler: ToolHandler,
         destructive: bool = False,
         flags: int = re.IGNORECASE,
+        guard: "Callable[[re.Match], bool] | None" = None,
     ) -> None:
         """Registers a tool. `pattern` is compiled once here — callers
         pass a raw regex string, not a pre-compiled Pattern, so tool
         definitions read as plain declarations (see
         ember_core.py's _register_builtin_tools for the full list)."""
         compiled = re.compile(pattern, flags)
-        self._tools.append(Tool(name=name, description=description, pattern=compiled, handler=handler, destructive=destructive))
+        self._tools.append(Tool(name=name, description=description, pattern=compiled, handler=handler, destructive=destructive, guard=guard))
 
     def match(self, message: str) -> "tuple[Tool, re.Match] | None":
         """Returns the first registered tool whose pattern matches
@@ -100,7 +102,7 @@ class ToolRegistry:
         this got refactored."""
         for tool in self._tools:
             m = tool.pattern.search(message)
-            if m:
+            if m and (tool.guard is None or tool.guard(m)):
                 return tool, m
         return None
 

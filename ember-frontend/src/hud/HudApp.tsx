@@ -82,13 +82,13 @@ function TurnCard({ turn }: { turn: HudTurn }) {
       <div
         className={`hud-text relative max-w-[88%] px-3.5 py-2.5 text-[13.5px] leading-relaxed ${
           isUser
-            ? "rounded-[14px_4px_14px_14px] border border-[#E1712F]/70 bg-[#E1712F]/[0.38] text-[#FFE9D9]"
+            ? "rounded-[14px_4px_14px_14px] border border-[#60A5FA]/35 bg-[#1E3A8A]/60 text-[#DCE9FF]"
             : "rounded-[4px_14px_14px_14px] border border-[#7DD3FC]/40 bg-[#7DD3FC]/[0.16] text-[#EAF6FF]"
         }`}
       >
         {/* the "tab": a short accent bar sitting on the card's top edge */}
         <span
-          className={`absolute -top-px h-[2px] w-7 rounded-full ${isUser ? "right-3 bg-[#E1712F]" : "left-3 bg-[#7DD3FC]"}`}
+          className={`absolute -top-px h-[2px] w-7 rounded-full ${isUser ? "right-3 bg-[#3B82F6]" : "left-3 bg-[#7DD3FC]"}`}
         />
 
         {empty && turn.pending ? (

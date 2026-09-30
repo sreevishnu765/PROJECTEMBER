@@ -105,9 +105,14 @@ import ember_confirmation
 from ember_bus import get_bus
 from ember_conversation import get_conversation_registry
 from ember_query_registry import get_query_registry
+from ember_attachments import save_attachments, default_upload_dir
 
 AUTH_TOKEN_ENV = "EMBER_TRANSPORT_TOKEN"
 AUTH_TIMEOUT_SECONDS = 10
+# websockets' own default is 1 MiB, which silently closes the connection on any
+# real chat attachment (files travel base64-encoded in one JSON message, ~1.33x
+# their size). ember_attachments.MAX_TOTAL_BYTES is 15 MB, so ~20 MB on the wire.
+MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
 
 class TransportAuthError(Exception):
@@ -398,10 +403,30 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
                 continue
 
             text = msg.get("text", "")
-            if not text.strip():
+            raw_atts = msg.get("attachments") or []
+            if not text.strip() and not raw_atts:
                 continue
 
+            if raw_atts:
+                # Checked BEFORE saving anything, so a rejected "already in
+                # progress" message never leaves orphaned files in data/uploads.
+                if _turn_active():
+                    await websocket.send(json.dumps({
+                        "type": "error",
+                        "message": "a turn is already in progress on this connection — send 'cancel' first if you want to redirect it.",
+                    }))
+                    continue
+                saved, att_error = await asyncio.to_thread(save_attachments, raw_atts, default_upload_dir())
+                if att_error:
+                    await websocket.send(json.dumps({"type": "error", "message": att_error}))
+                    continue
+                # Read (and cleared) by ember_core.process_turn once per turn.
+                conversation.attachments = saved
+                if not text.strip():
+                    text = "Please take a look at the attached file(s)."
+
             if not await _start_turn(text):
+                conversation.attachments = None
                 # One turn at a time per connection — a second "message"
                 # arriving mid-turn is rejected rather than silently
                 # racing two process_turn_fn calls against the same
@@ -452,6 +477,6 @@ async def run_transport_server(process_turn_fn, host: str = "localhost", port: i
     async def handler(websocket):
         await _handle_connection(websocket, process_turn_fn, voice_engines=voice_engines, enable_voice=enable_voice)
 
-    async with websockets.serve(handler, host, port):
+    async with websockets.serve(handler, host, port, max_size=MAX_MESSAGE_BYTES):
         print(f"[ember_transport] WebSocket server listening on ws://{host}:{port}")
         await asyncio.Future()  # run forever

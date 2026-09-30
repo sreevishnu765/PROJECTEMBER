@@ -29,6 +29,7 @@ from ember_tools import computer as computer_tools
 from ember_tools import spotify as spotify_tool
 from ember_tools import calendar as calendar_tool
 from ember_tools import drive as drive_tool
+from ember_tools import file_ops
 from ember_reminders import (
     ReminderStore, parse_natural_time, TIME_PHRASE_RE,
     parse_recurrence, RECURRENCE_PHRASE_RE,
@@ -43,6 +44,7 @@ from ember_runtime import EmberRuntime
 from ember_tools.google_auth_watchdog import GoogleAuthWatchdog
 import ember_intent
 import ember_research
+import ember_attachments
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _MEMORY_DB_PATH = os.path.join(_PROJECT_ROOT, "data", "ember_memory.db")
@@ -692,6 +694,19 @@ _CALENDAR_CORRECT_RE = re.compile(
     r"(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*(?:,?\s*ember)?[.!]?\s*$",
     re.IGNORECASE,
 )
+# ---- File operations by name (ember_tools/file_ops.py) ----------------------
+# "move the drivetrain pdf to documents" / "rename it to final" / "delete that
+# file" / "undo that". The regexes only capture the tail after the verb; the
+# verb-specific parsing (where the file name ends and the destination begins)
+# happens in file_ops.py, which tries each " to "/" into " position. Each tool
+# is also guarded by file_ops.looks_like_file_request so "move the meeting to
+# friday" never reaches a file tool.
+_FILE_MOVE_RE = re.compile(r"\b(?:move|relocate)\s+(?P<tail>.+)$", re.IGNORECASE)
+_FILE_RENAME_RE = re.compile(r"\brename\s+(?P<tail>.+)$", re.IGNORECASE)
+_FILE_DELETE_RE = re.compile(r"\b(?:delete|trash)\s+(?P<tail>.+)$", re.IGNORECASE)
+_FILE_OPEN_RE = re.compile(r"\bopen\s+(?P<tail>.+)$", re.IGNORECASE)
+_FILE_REVEAL_RE = re.compile(r"\b(?:show|reveal)\s+(?P<tail>.+?)\s+in\s+(?:the\s+)?(?:file\s+)?(?:explorer|folder|finder)\b", re.IGNORECASE)
+_FILE_UNDO_RE = re.compile(r"\bundo\s+(?:that|it|the\s+last\s+(?:file\s+)?(?:move|rename|delete|deletion|operation|action))\b", re.IGNORECASE)
 _DRIVE_DOWNLOAD_RE = re.compile(r"\bdownload\s+(?:this\s+|that\s+)?(?:from\s+)?(https?://drive\.google\.com/\S+)", re.IGNORECASE)
 
 # Real capability gap, not just a missed trigger: there was NO way to
@@ -870,6 +885,34 @@ def _register_builtin_tools() -> None:
 
     registry.register("list_reminders", "Lists active reminders", _REMINDER_LIST_RE.pattern, _list_reminders)
 
+    # ---- Opening files/folders by name ---------------------------------
+    # Registered BEFORE launch_app: "open that file" used to fall into launch_app and
+    # print "Launched that file." without opening anything. "open notepad" (no file-ish
+    # signal) still reaches launch_app untouched.
+    def _open_item(match):
+        res = file_ops.open_item(_strip_trailing_address(match.group("tail").strip()),
+                                 [e["path"] for e in file_registry.list_all() if e.get("path")],
+                                 _dispatch_context.get("last_file"))
+        if res.ok and res.dst:
+            _dispatch_context["last_file"] = res.dst
+        return res.message
+
+    def _reveal_item(match):
+        res = file_ops.open_item(_strip_trailing_address(match.group("tail").strip()),
+                                 [e["path"] for e in file_registry.list_all() if e.get("path")],
+                                 _dispatch_context.get("last_file"), reveal=True)
+        if res.ok and res.dst:
+            _dispatch_context["last_file"] = res.dst
+        return res.message
+
+    registry.register(
+        "open_file", "Opens a file or folder by name in its default app", _FILE_OPEN_RE.pattern, _open_item,
+        guard=lambda m: not file_ops.is_app_name(m.group("tail")) and (
+            file_ops.looks_like_file_request(m.group("tail"))
+            or (bool(_dispatch_context.get("last_file")) and file_ops.is_pronoun(m.group("tail")))),
+    )
+    registry.register("reveal_file", "Shows a file or folder in File Explorer", _FILE_REVEAL_RE.pattern, _reveal_item)
+
     def _launch_app(match):
         arg = _strip_trailing_address(match.group(1).strip().strip(".!?"))
         words = arg.lower().split()
@@ -1001,6 +1044,61 @@ def _register_builtin_tools() -> None:
         return computer_tools.run_script(_strip_trailing_address(match.group(1).strip().strip(".!?")))
 
     registry.register("run_script", "Executes an allowlisted script — always confirmed", _RUN_SCRIPT_RE.pattern, _run_script, destructive=True)
+
+    # ---- File operations by name ---------------------------------------
+    def _known_file_paths() -> "list[str]":
+        return [e["path"] for e in file_registry.list_all() if e.get("path")]
+
+    def _finish_file_op(res) -> str:
+        """Keeps the Files panel and the "that file" context in step with what
+        actually happened on disk."""
+        if res.ok and res.op == "open" and res.dst:
+            _dispatch_context["last_file"] = res.dst
+        elif res.ok and res.src and res.dst:
+            if res.op == "delete":
+                file_registry.remove_path(res.src)
+                if res.is_dir:
+                    file_registry.remove_prefix(res.src)
+                _dispatch_context["last_file"] = None
+            else:  # move / rename / undo
+                file_registry.update_path(res.src, res.dst)
+                if res.is_dir:
+                    file_registry.update_prefix(res.src, res.dst)   # files recorded inside the folder follow it
+                _dispatch_context["last_file"] = res.dst
+        return res.message
+
+    def _tail(match) -> str:
+        return _strip_trailing_address(match.group("tail").strip())
+
+    def _move_file(match):
+        return _finish_file_op(file_ops.move_file(_tail(match), _known_file_paths(), _dispatch_context.get("last_file")))
+
+    def _rename_file(match):
+        return _finish_file_op(file_ops.rename_file(_tail(match), _known_file_paths(), _dispatch_context.get("last_file")))
+
+    def _delete_file(match):
+        def _confirm(path: str, detail: str = "") -> bool:
+            # Asked AFTER the name is resolved, so the person approves the exact file or
+            # folder (not just their own words); for a folder, `detail` says how much is in
+            # it. Fails closed if there's no gate to ask.
+            gate = _dispatch_context.get("confirm_gate") or _confirm_gate
+            args = {"file": path, "action": "move to Ember's trash (recoverable)"}
+            if detail:
+                args["contents"] = detail
+            return gate.request_confirmation("delete_file", args, _dispatch_context.get("conversation"))
+        return _finish_file_op(file_ops.trash_file(_tail(match), _confirm, _known_file_paths(), _dispatch_context.get("last_file")))
+
+    def _undo_file_op(match):
+        return _finish_file_op(file_ops.undo_last())
+
+    _pronoun_ok = lambda m: bool(_dispatch_context.get("last_file")) and file_ops.pronoun_request(m.group("tail"))  # noqa: E731
+    _file_guard = lambda m: file_ops.looks_like_file_request(m.string) or _pronoun_ok(m)  # noqa: E731
+    registry.register("move_file", "Moves a file into a folder, found by name", _FILE_MOVE_RE.pattern, _move_file, guard=_file_guard)
+    registry.register("rename_file", "Renames a file, found by name", _FILE_RENAME_RE.pattern, _rename_file, guard=_file_guard)
+    registry.register("delete_file", "Moves a file to Ember's trash after confirmation", _FILE_DELETE_RE.pattern, _delete_file,
+                      guard=lambda m: bool(file_ops._FILE_WORD.search(m.string) or file_ops._FILENAME_TOKEN.search(m.string)
+                                           or file_ops._FILE_TYPE_WORD.search(m.string)))
+    registry.register("undo_file_op", "Undoes the last file move/rename/delete", _FILE_UNDO_RE.pattern, _undo_file_op)
 
     # ---- Picked up from Nexus VII (this pass) ------------------------
     def _play_spotify(match):
@@ -1212,6 +1310,21 @@ def _register_builtin_queries() -> None:
 
     registry.register("files_list", "Lists recorded uploads/analyses and generated files", _files_list)
 
+    def _file_open(params: dict) -> dict:
+        """Files panel click -> open (or reveal) a RECORDED file. Takes an entry id, never a
+        path, so a client can't ask Ember to open arbitrary locations."""
+        entry = file_registry.get(str(params.get("id", "")))
+        if not entry:
+            return {"opened": False, "message": "That entry isn't in the list any more, sir."}
+        if not entry.get("path"):
+            return {"opened": False, "message": "No file location was recorded for this entry, sir."}
+        res = file_ops.open_path(entry["path"], reveal=bool(params.get("reveal")))
+        if res.ok:
+            _dispatch_context["last_file"] = entry["path"]
+        return {"opened": res.ok, "message": res.message}
+
+    registry.register("file_open", "Opens (or reveals in Explorer) a file from the Files panel", _file_open)
+
     def _history_list_sessions(params: dict) -> list:
         return conversation_history.list_sessions(limit=params.get("limit", 50))
 
@@ -1248,6 +1361,8 @@ def _dispatch_action(action_payload: "tuple", last_assistant_reply: "str | None"
     tool, match = action_payload
     _dispatch_context["last_assistant_reply"] = last_assistant_reply
     gate = (conversation.confirm_gate if conversation and conversation.confirm_gate else None) or _confirm_gate
+    _dispatch_context["confirm_gate"] = gate
+    _dispatch_context["conversation"] = conversation
     return _tool_registry.dispatch(tool, match, confirm_gate=gate, conversation=conversation)
 
 
@@ -1755,6 +1870,41 @@ def _build_runtime() -> EmberRuntime:
     )
 
 
+def _vision_for_attachments(image_bytes: bytes, mime_type: str, query: str) -> str:
+    """Same Gemini vision call the analyze_document tool uses, at module
+    level so the attachment path (ember_attachments.py) can reach it."""
+    response = llm_client._gemini_client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=[{"parts": [
+            {"text": query},
+            {"inline_data": {"mime_type": mime_type, "data": image_bytes}},
+        ]}],
+    )
+    return response.text or ""
+
+
+def _on_attachment_saved(att: dict) -> None:
+    file_registry.record("upload", "attached", att["path"], label=att["name"])
+    _dispatch_context["last_file"] = att["path"]   # so "move that to documents" works right after an upload
+
+
+def _augment_with_attachments(prompt: str, conversation, stream_callback) -> str:
+    """Folds chat-attached files (or a still-warm block from a recent turn)
+    into this turn's final prompt. See ember_attachments.py for the safety
+    and bounding rules. Never raises: a failure here degrades to answering
+    without the file, plainly noted, never to a crashed turn."""
+    try:
+        return ember_attachments.augment_prompt(
+            prompt, conversation,
+            vision_call=_vision_for_attachments if llm_client.cloud_available() else None,
+            status_fn=lambda t: _emit_stream_status(stream_callback, t),
+            on_saved=_on_attachment_saved,
+        )
+    except Exception as e:
+        print(f"[ember_core] attachment handling failed: {e}")
+        return prompt + "\n\n(The user attached file(s), but reading them failed; say so rather than guessing at their contents.)"
+
+
 def _emit_stream_status(stream_callback, text: str) -> None:
     """Best-effort transient progress indicator for a slow, otherwise
     silent step — a Tavily research() round (up to 2 per turn, several
@@ -1850,6 +2000,11 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
 
     history_snapshot = conversation.snapshot_history()
     intent, verify_topic, action_payload = classify_intent(user_input, history_snapshot)
+    if getattr(conversation, "attachments", None):
+        # A message with files attached is a question ABOUT those files. Without
+        # this, "analyze this image" would hit _ANALYZE_IMAGE_RE and answer
+        # "I need a file path", and typed words could trigger tools/commands.
+        intent, verify_topic, action_payload = "chat", None, None
     wants_search = intent == "search"
     verified_via_evidence = False
     search_evidence_used = False
@@ -2017,6 +2172,8 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
     else:
         effective_prompt = user_input
 
+    effective_prompt = _augment_with_attachments(effective_prompt, conversation, stream_callback)
+
     if wants_search and stream_callback is not None:
         # Reached only when no independent evidence was available/usable
         # (Tavily unconfigured, the call failed, or came back off-topic) —
@@ -2072,8 +2229,17 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
             _append_history("user", user_input, conversation=conversation)
             _append_history("assistant", reply_text, conversation=conversation)
             return "cancelled", reply_text
+        # What goes into HISTORY is only what the model actually wrote. The failure
+        # note below is for the person reading the chat; it must never be fed back
+        # to the model (it used to be, so Ember then talked about "a server timeout"
+        # and re-offered the answer instead of simply finishing it).
+        history_text = reply_text
+        if final_chunk and final_chunk.recovered_from:
+            print(f"[ember_core] reply was cut off ({final_chunk.recovered_from}) and continued on {final_chunk.model}.")
         if final_chunk and final_chunk.error:
-            reply_text = reply_text + f"\n\n[{final_chunk.error}]" if reply_text else f"[{final_chunk.error}]"
+            print(f"[ember_core] reply cut off and could not be recovered: {final_chunk.error}")
+            note = "[The reply was cut off by a provider error, sir. Say \"continue\" and I'll pick it up.]"
+            reply_text = f"{reply_text}\n\n{note}" if reply_text else note
 
         actually_grounded = search_evidence_used or verified_via_evidence
         source = final_chunk.source if final_chunk else "local"
@@ -2087,7 +2253,7 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
                 print(f"[ember_core] {store_result['warning']}")
 
         _append_history("user", user_input, conversation=conversation)
-        _append_history("assistant", reply_text, used_search=actually_grounded, conversation=conversation)
+        _append_history("assistant", history_text or reply_text, used_search=actually_grounded, conversation=conversation)
         print(f"[ember_core] turn total {time.perf_counter() - _t_turn:.1f}s (research {research_s:.1f}s, streamed)")
         return tag, reply_text
 
