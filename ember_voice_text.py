@@ -67,6 +67,55 @@ _UNDER_EM_RE = re.compile(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 _END_PUNCT = ".!?:;,"
 
+# ---- file paths and file names ----------------------------------------------------------
+# A reply like "Moved 'a_b.pdf' from C:\\Users\\x\\Downloads to D:\\VISHNU" used to be read out
+# letter by letter ("C colon backslash Users backslash ..."). Spoken, a path is only ever
+# useful as its LAST part ("Downloads", "VISHNU"); the full path stays on screen. A bare drive
+# root becomes "the D drive". Words like "to"/"from" end a folder name that contains spaces, so
+# "...\\Downloads to D:\\VISHNU" can't swallow the sentence around it.
+_PATH_STOPWORDS = r"(?:to|from|into|and|in|on|at|as|then|or)"
+_PATH_WORD = r'[^\\/:*?"<>|\s]+'
+_WIN_PATH_RE = re.compile(
+    r"[A-Za-z]:\\"
+    rf"(?:{_PATH_WORD}(?: (?!{_PATH_STOPWORDS}\b){_PATH_WORD})*\\)*"
+    rf"{_PATH_WORD}?"
+)
+_POSIX_PATH_RE = re.compile(r"(?<![\w/:.])(?:~|\.{1,2})?/(?:[\w.\-~@+]+/)+[\w.\-~@+]*")
+_PATH_TRAIL_RE = re.compile(r"[.,;:!?)\]'\"]+$")
+_FILE_EXTS = (
+    "pdf|docx?|xlsx?|pptx?|txt|md|csv|json|zip|rar|7z|png|jpe?g|gif|webp|bmp|svg|mp3|wav|mp4|mkv|mov|"
+    "py|js|ts|tsx|html?|css|log|exe|msi|bat|ps1|lnk|iso"
+)
+_FILENAME_RE = re.compile(rf"(?<![\w.])([\w\-]+(?:[_\- ][\w\-]+)*)\.({_FILE_EXTS})\b(?![\w@/])", re.IGNORECASE)
+# Usage hints that belong on screen, not in the speech: (Say "undo that" to reverse it.)
+_HINT_RE = re.compile(r"\(\s*say\b[^)]*\)", re.IGNORECASE)
+
+
+def _speak_name(name: str) -> str:
+    """'drivetrain_comparision.pdf' -> 'drivetrain comparision pdf' (no underscores, no dot)."""
+    name = _FILENAME_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}", name)
+    return re.sub(r"[_\s]+", " ", name).strip()
+
+
+def _speak_path(m: "re.Match") -> str:
+    raw = m.group(0)
+    trail_m = _PATH_TRAIL_RE.search(raw)
+    trail = trail_m.group(0) if trail_m else ""
+    body = raw[: len(raw) - len(trail)] if trail else raw
+    parts = [seg for seg in re.split(r"[\\/]", body) if seg and seg not in ("~", ".", "..")]
+    if not parts:
+        return raw
+    if len(parts) == 1 and re.fullmatch(r"[A-Za-z]:", parts[0]):
+        return f"the {parts[0][0].upper()} drive{trail}"
+    return _speak_name(parts[-1]) + trail
+
+
+def speakable_paths(line: str) -> str:
+    """Replaces file paths with their last component and tidies bare file names."""
+    line = _WIN_PATH_RE.sub(_speak_path, line)
+    line = _POSIX_PATH_RE.sub(_speak_path, line)
+    return _FILENAME_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}".replace("_", " "), line)
+
 
 def _clean_line(line: str) -> str:
     stripped = line.strip()
@@ -89,7 +138,9 @@ def _clean_line(line: str) -> str:
     line = _IMAGE_RE.sub(r"\1", line)
     line = _LINK_RE.sub(r"\1", line)
     line = _URL_RE.sub("a link", line)
+    line = _HINT_RE.sub("", line)
     line = _INLINE_CODE_RE.sub(r"\1", line)
+    line = speakable_paths(line)
     line = _BOLD_RE.sub(r"\2", line)
     line = _STAR_EM_RE.sub(r"\1", line)
     line = _UNDER_EM_RE.sub(r"\1", line)
@@ -523,6 +574,78 @@ def is_stop_command(text: str) -> bool:
     ember_intent.py's INTERRUPT: 'stop the AQI forecasting system' is
     about something else and must reach the normal pipeline."""
     return bool(_STOP_RE.match(_normalize(text)))
+
+
+# ---------------------------------------------------------------------------
+# 3b. Spoken confirmation (yes / no) for destructive actions
+# ---------------------------------------------------------------------------
+# When Ember needs approval ("allow access to Downloads", "delete that file") and the
+# person is talking to her rather than looking at the app, she asks out loud and listens
+# for the answer. Deny is the safe direction: any clear "no"/"stop"/"cancel" counts, and a
+# message that mixes yes and no, or carries a "wait"/"but"/question word, is NOT an
+# approval — it returns None so she asks again instead of acting on a guess.
+
+_YES_START = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright", "affirmative", "absolutely",
+    "definitely", "approve", "approved", "confirm", "confirmed", "proceed", "allow", "grant",
+}
+_YES_PHRASE_STARTS = {("go", "ahead"), ("do", "it"), ("go", "for"), ("that's", "fine"), ("sounds", "good")}
+_NO_TOK = {
+    "no", "nope", "nah", "don't", "dont", "not", "never", "deny", "denied", "negative",
+    "cancel", "stop", "abort", "nevermind", "refuse",
+}
+_NOT_A_YES = {"wait", "hold", "but", "actually", "hmm", "what", "which", "why", "how", "where", "who", "when"}
+_CONFIRM_WAKE_LEAD = {"hey", "ember"}
+
+
+def parse_confirmation_reply(text: str) -> "str | None":
+    """'yes' | 'no' | None for a short spoken answer to "shall I...?". Anchored on a short
+    utterance (<= 8 words) so a long sentence that happens to contain "yes" never approves."""
+    toks = _normalize(text).split()
+    while toks and (toks[0] in _CONFIRM_WAKE_LEAD or ember_like(toks[0])):
+        toks = toks[1:]
+    if not toks or len(toks) > 8:
+        return None
+    no_hit = any(t in _NO_TOK for t in toks) or (len(toks) >= 2 and toks[0] == "never" and toks[1] == "mind")
+    yes_hit = toks[0] in _YES_START or tuple(toks[:2]) in _YES_PHRASE_STARTS
+    if no_hit and yes_hit:
+        return None
+    if no_hit:
+        return "no"
+    if yes_hit and not any(t in _NOT_A_YES for t in toks):
+        return "yes"
+    return None
+
+
+def _last_part(raw: str) -> str:
+    """Spoken form of a path or name: its last component, tidied."""
+    cleaned = speakable_paths((raw or "").strip().strip("'\".,!?"))
+    return cleaned or "that"
+
+
+def confirmation_prompt(tool_name: str, args: "dict | None" = None) -> str:
+    """One short sentence asking for approval, built from what the gate was asked about.
+    Only the last part of a path is ever spoken (the full path is on screen)."""
+    args = args or {}
+    name = (tool_name or "").lower()
+    matched = str(args.get("matched_text") or "")
+    if name == "allow_path":
+        m = re.search(r"access(?:\s+to)?\s+(.+)$", matched, re.IGNORECASE)
+        what = _last_part(m.group(1)) if m else "that folder"
+        ask = f"Allow access to {what}"
+    elif name == "delete_file":
+        ask = f"Move {_last_part(str(args.get('file') or ''))} to the trash"
+    elif name == "run_script":
+        ask = "Run that script"
+    elif name == "clear_memory":
+        ask = "Wipe everything I remember"
+    elif name == "forget_memory":
+        ask = "Forget that"
+    elif name.startswith("cancel_calendar"):
+        ask = "Cancel that calendar event"
+    else:
+        ask = "Go ahead with " + name.replace("_", " ") if name else "Go ahead"
+    return clean_for_speech(f"{ask}, sir \u2014 yes or no?")
 
 
 # ---------------------------------------------------------------------------

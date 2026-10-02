@@ -15,6 +15,7 @@ import { UsagePanel } from "./components/panels/UsagePanel";
 import { SettingsPanel } from "./components/panels/SettingsPanel";
 import { useEmberChat } from "./hooks/useEmberChat";
 import type { HudState } from "./types";
+import { describeConfirmation } from "./lib/confirmText";
 
 export type PanelId = "history" | "memory" | "systems" | "devices" | "files" | "usage" | "settings" | null;
 
@@ -114,9 +115,11 @@ export default function App() {
         if (text) sendMessage(text);
       } else if (cmd.type === "stop") {
         stopSpeaking();
+      } else if (cmd.type === "confirm") {
+        respondConfirmation(cmd.approved);
       }
     });
-  }, [sendMessage, stopSpeaking]);
+  }, [sendMessage, stopSpeaking, respondConfirmation]);
 
   // Push a compact snapshot to the HUD whenever something it shows changes.
   useEffect(() => {
@@ -124,6 +127,9 @@ export default function App() {
     if (!api || !hudOpen) return;
     const snapshot: HudState = {
       connected: connectionState === "connected",
+      confirmation: pendingConfirmation
+        ? { toolName: pendingConfirmation.toolName, summary: describeConfirmation(pendingConfirmation) }
+        : null,
       voiceState: voiceStatus.state,
       awake: voiceStatus.awake,
       voiceMode: voiceStatus.voiceMode,
@@ -140,7 +146,7 @@ export default function App() {
       })),
     };
     api.publishState(snapshot);
-  }, [hudOpen, messages, voiceStatus, isGenerating, connectionState]);
+  }, [hudOpen, messages, voiceStatus, isGenerating, connectionState, pendingConfirmation]);
 
   if (connectionState !== "connected") {
     // Auto-connecting inside the Electron shell: show a quiet loading

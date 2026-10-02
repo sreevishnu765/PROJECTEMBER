@@ -188,6 +188,17 @@ class SessionConfirmationGate:
         pending.event.set()
         return True
 
+    def deny_all(self) -> "list[str]":
+        """Resolves every pending request as NOT approved and returns their ids. Used when
+        the turn that asked is being cancelled: its worker thread is parked in
+        request_confirmation(), and without this it would sit there until the timeout."""
+        with self._lock:
+            items = list(self._pending.items())
+        for _rid, pending in items:
+            pending.approved = False
+            pending.event.set()
+        return [rid for rid, _ in items]
+
     def pending_count(self) -> int:
         with self._lock:
             return len(self._pending)

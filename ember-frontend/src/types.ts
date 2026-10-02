@@ -61,6 +61,7 @@ export type ServerMessage =
   | { type: "status"; text: string }
   | { type: "done"; tag: string; text: string }
   | { type: "confirmation_required"; request_id: string; tool_name: string; args: Record<string, unknown> }
+  | { type: "confirmation_resolved"; request_id: string; approved: boolean; by?: string }
   | { type: "query_result"; id: string; ok: true; data: unknown }
   | { type: "query_result"; id: string; ok: false; error: string }
   | { type: "error"; message: string }
@@ -155,8 +156,16 @@ export interface HudTurn {
   pending: boolean;
 }
 
+export interface HudConfirmation {
+  toolName: string;
+  /** Short human text for the card — only the last path part, never a full path. */
+  summary: string;
+}
+
 export interface HudState {
   connected: boolean;
+  /** An approval waiting for yes/no — shown in the HUD so nobody has to open the main window. */
+  confirmation: HudConfirmation | null;
   /** Raw voice_state.state from the backend, if any. */
   voiceState: string | null;
   awake: boolean;
@@ -167,4 +176,8 @@ export interface HudState {
   turns: HudTurn[];
 }
 
-export type HudCommand = { type: "send"; text: string } | { type: "stop" } | { type: "close" };
+export type HudCommand =
+  | { type: "send"; text: string }
+  | { type: "stop" }
+  | { type: "close" }
+  | { type: "confirm"; approved: boolean };

@@ -125,6 +125,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from ember_voice_text import (
+    parse_confirmation_reply,
     SentenceChunker, detect_wake, is_stop_command, is_stt_garbage,
     looks_like_echo, name_aliases, parse_voice_mode_command, soft_wake_vetoed, strip_wake_residue,
 )
@@ -1096,6 +1097,12 @@ class VoiceSession:
         self._recent_spoken: "collections.deque" = collections.deque(maxlen=8)
 
         self._voice_turn_pending = False
+        # Spoken approval of destructive actions ("allow access to X", "delete that file").
+        # _spoken_confirm is switched on by the client (the HUD does, since its user is
+        # talking rather than looking at the app); _confirm_pending is the one request
+        # currently waiting for a yes/no.
+        self._spoken_confirm = False
+        self._confirm_pending: "dict | None" = None
         self._reply_voice_origin = False
         self._reply_active = False
         self._speak_reply = False
@@ -1164,6 +1171,8 @@ class VoiceSession:
         elif action == "speaker":
             self._speaker_on = bool(msg.get("on"))
             self._refresh_state(force=True)
+        elif action == "spoken_confirm":
+            self._spoken_confirm = bool(msg.get("on"))
         elif action == "barge_in":
             self.config.barge_in = bool(msg.get("on"))
         elif action == "debug":
@@ -1530,6 +1539,70 @@ class VoiceSession:
                     self._unduck()   # speech burst too short to transcribe
             self._refresh_state()
 
+    # ------------------------------------------------------------------ spoken confirmation
+    # Tools whose effect can't be undone, or that run code, are never approved by voice —
+    # a stray "yes" from a video must not be able to start a script or wipe memory.
+    VOICE_CONFIRM_BLOCKED = ("run_script", "clear_memory", "forget_memory")
+    CONFIRM_WINDOW_S = 120.0     # same as SessionConfirmationGate.DEFAULT_TIMEOUT_SECONDS
+
+    def can_ask_confirmation(self, tool_name: str) -> bool:
+        with self._lock:
+            return (self._spoken_confirm and self._listening and self._confirm_pending is None
+                    and (tool_name or "").lower() not in self.VOICE_CONFIRM_BLOCKED)
+
+    def ask_confirmation(self, request_id: str, prompt: str, resolve: Callable[[bool], None]) -> bool:
+        """Speaks `prompt` and listens for yes/no — no wake word needed while it's pending.
+        `resolve(approved)` is called exactly once. False if voice can't take this one
+        (the on-screen dialog is still there either way)."""
+        with self._lock:
+            if self._confirm_pending is not None or not (self._spoken_confirm and self._listening):
+                return False
+            self._confirm_pending = {"id": request_id, "resolve": resolve, "until": self._clock() + self.CONFIRM_WINDOW_S, "retried": False}
+        self._log(f"asking for spoken confirmation ({request_id})")
+        self._say(prompt)
+        return True
+
+    def cancel_confirmation(self, request_id: str = "") -> None:
+        """The request was answered some other way (a click) or went away."""
+        with self._lock:
+            p = self._confirm_pending
+            if p is not None and (not request_id or p["id"] == request_id):
+                self._confirm_pending = None
+
+    def _answer_confirmation(self, approved: bool) -> bool:
+        with self._lock:
+            p, self._confirm_pending = self._confirm_pending, None
+        if p is None:
+            return False
+        self._log(f"spoken confirmation {p['id']}: {'approved' if approved else 'denied'}")
+        try:
+            p["resolve"](approved)
+        except Exception as e:
+            self._log(f"confirmation resolve failed: {e}")
+        return True
+
+    def _try_spoken_confirmation(self, text: str, audio: "np.ndarray | None") -> bool:
+        """True if this utterance was consumed as the answer (or a re-ask) to a pending
+        confirmation. Only a short, clearly yes/no reply counts; a confident other-voice
+        verdict from the speaker lock is refused; anything unclear asks once more, then
+        waits for the on-screen buttons (and the gate's own timeout denies)."""
+        with self._lock:
+            p = self._confirm_pending
+            if p is None:
+                return False
+            if self._clock() > p["until"]:
+                self._confirm_pending = None
+                return False
+        answer = parse_confirmation_reply(text)
+        if answer is None:
+            return False          # ordinary speech: let the normal pipeline have it
+        if not self._speaker_ok(audio):
+            self._report(text, "ignored (confirmation, not enrolled voice)")
+            return True
+        self._report(text, f"accepted (confirmation: {answer})")
+        self._answer_confirmation(answer == "yes")
+        return True
+
     def _handle_acoustic_stop(self) -> None:
         """Fired the instant the KWS stream spots "stop" anywhere in the audio — no VAD segment,
         no transcription, no waiting for a pause. This is the actual fix for stop-while-speaking:
@@ -1547,6 +1620,10 @@ class VoiceSession:
         stray interrupt from someone else's voice is a cheap, instantly-recoverable mistake, and
         interrupt()/_cancel_turn() are already safe to call more than once if a couple of frames
         both cross the KWS threshold for the same utterance."""
+        if self._confirm_pending is not None:
+            self._log("stop (acoustic) while a confirmation is pending - treated as no")
+            self._answer_confirmation(False)
+            return
         if not (self._is_speaking() or self._turn_active()):
             return
         self._log("stop (acoustic)")
@@ -1754,6 +1831,9 @@ class VoiceSession:
             self._report(text, "dropped (echo of own speech)")
             return
 
+        if self._confirm_pending is not None and self._try_spoken_confirmation(text, full_audio):
+            return
+
         if acoustic:
             # The sound of "hey ember" was heard, whatever Whisper made of it. What Whisper transcribed
             # is only the part after it (plus maybe a syllable of the name, which is stripped).
@@ -1840,6 +1920,7 @@ class VoiceSession:
         if busy:
             self.interrupt()
             if self._turn_active():
+                self._answer_confirmation(False)   # a turn parked on an approval can't unwind otherwise
                 self._cancel_turn()
                 if not self._wait_turn_idle(self.config.busy_wait_seconds):
                     self._log("barge-in: previous turn didn't unwind in time")

@@ -17,6 +17,7 @@ const GLASS_LEVELS = [0.18, 0.4, 0.68];
 
 const EMPTY_STATE: HudState = {
   connected: false,
+  confirmation: null,
   voiceState: null,
   awake: false,
   voiceMode: false,
@@ -82,8 +83,8 @@ function TurnCard({ turn }: { turn: HudTurn }) {
       <div
         className={`hud-text relative max-w-[88%] px-3.5 py-2.5 text-[13.5px] leading-relaxed ${
           isUser
-            ? "rounded-[14px_4px_14px_14px] border border-[#60A5FA]/35 bg-[#1E3A8A]/60 text-[#DCE9FF]"
-            : "rounded-[4px_14px_14px_14px] border border-[#7DD3FC]/40 bg-[#7DD3FC]/[0.16] text-[#EAF6FF]"
+            ? "rounded-[14px_4px_14px_14px] border border-[#60A5FA]/45 bg-[#16295F] text-[#DCE9FF]"
+            : "rounded-[4px_14px_14px_14px] border border-[#7DD3FC]/50 bg-[#0F3550] text-[#EAF6FF]"
         }`}
       >
         {/* the "tab": a short accent bar sitting on the card's top edge */}
@@ -238,6 +239,30 @@ export function HudApp() {
             <div ref={bottomRef} />
           </div>
         </div>
+
+        {/* Approval card: answer by voice ("yes"/"no") or with these buttons */}
+        {state.confirmation && (
+          <div className="shrink-0 px-4 pb-2">
+            <div className="hud-text rounded-[14px] border border-ember/60 bg-[#2A1A10] px-3.5 py-2.5">
+              <div className="text-[13px] text-[#FFE7D2]">{state.confirmation.summary}</div>
+              <div className="mt-1 text-[11px] text-[#F2A65A]/80">Say yes or no, sir.</div>
+              <div className="hud-nodrag mt-2 flex gap-2">
+                <button
+                  onClick={() => window.emberHud?.sendCommand({ type: "confirm", approved: false })}
+                  className="flex-1 rounded-lg border border-[#7DD3FC]/30 py-1.5 text-[12.5px] text-[#EAF6FF] hover:bg-white/10"
+                >
+                  Deny
+                </button>
+                <button
+                  onClick={() => window.emberHud?.sendCommand({ type: "confirm", approved: true })}
+                  className="flex-1 rounded-lg bg-ember py-1.5 text-[12.5px] font-medium text-base"
+                >
+                  Approve
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Small text box — replies to typed text are spoken too */}
         <div className="shrink-0 px-4 pb-4 pt-1">

@@ -102,6 +102,7 @@ import uuid
 from pathlib import Path
 
 import ember_confirmation
+from ember_voice_text import confirmation_prompt
 from ember_bus import get_bus
 from ember_conversation import get_conversation_registry
 from ember_query_registry import get_query_registry
@@ -220,6 +221,16 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
             websocket.send(json.dumps({"type": "confirmation_required", **payload})),
             loop,
         )
+        # If the person is talking to Ember (HUD open), ask out loud too, so they don't have
+        # to go back to the app to click. The dialog/HUD buttons stay valid either way; the
+        # first answer wins. Irreversible tools are screen-only (see VoiceSession).
+        v = voice
+        rid, tool = payload.get("request_id", ""), payload.get("tool_name", "")
+        if v is not None and rid and v.can_ask_confirmation(tool):
+            def _answered(approved: bool, _rid=rid) -> None:
+                confirm_gate.resolve(_rid, approved)
+                _send_threadsafe({"type": "confirmation_resolved", "request_id": _rid, "approved": approved, "by": "voice"})
+            v.ask_confirmation(rid, confirmation_prompt(tool, payload.get("args")), _answered)
 
     bus.subscribe("confirmation.requested", _on_confirmation_requested)
 
@@ -250,6 +261,10 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
         print(f"[ember_transport] cancel requested by {source} (turn {'active' if active else 'idle - ignored'})")
         if active:
             conversation.request_cancel()
+            # A turn parked on an approval can't see the cancel flag: answer "no" for it.
+            if voice is not None:
+                voice.cancel_confirmation()
+            confirm_gate.deny_all()
 
     def _ensure_voice():
         """Creates this connection's VoiceSession on first use. Returns None
@@ -383,6 +398,8 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
 
             if msg_type == "confirm":
                 confirm_gate.resolve(msg.get("request_id", ""), bool(msg.get("approved")))
+                if voice is not None:
+                    voice.cancel_confirmation(msg.get("request_id", ""))
                 continue
 
             if msg_type == "query":

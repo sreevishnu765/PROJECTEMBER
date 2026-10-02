@@ -82,6 +82,10 @@ export function useEmberChat() {
           if (savedVoice) {
             wsRef.current?.send(JSON.stringify({ type: "voice", action: "voice", name: savedVoice.toLowerCase() }));
           }
+          // HUD still open across a reconnect: keep spoken approval on.
+          if (hudPriorModeRef.current !== null) {
+            wsRef.current?.send(JSON.stringify({ type: "voice", action: "spoken_confirm", on: true }));
+          }
           // Wake-word listening no longer waits for a button click.
           if (localStorage.getItem(AUTO_LISTEN_KEY) !== "0") {
             void startListeningRef.current(true);
@@ -129,6 +133,10 @@ export function useEmberChat() {
             toolName: msg.tool_name,
             args: msg.args,
           });
+          break;
+        case "confirmation_resolved":
+          // Answered by voice: close the dialog / HUD card without a click.
+          setPendingConfirmation((cur) => (cur && cur.requestId === msg.request_id ? null : cur));
           break;
         case "query_result": {
           const resolve = pendingQueriesRef.current.get(msg.id);
@@ -421,6 +429,8 @@ export function useEmberChat() {
     if (!playbackRef.current) playbackRef.current = new VoicePlaybackQueue();
     playbackRef.current.resume();
     sendVoiceControl("speaker", { on: true });
+    // The HUD user is talking, not looking at the app: let Ember ask for approvals out loud.
+    sendVoiceControl("spoken_confirm", { on: true });
 
     const micOk = await startListening(false);
     if (!micOk) {
@@ -441,6 +451,7 @@ export function useEmberChat() {
     if (prior === null) return; // HUD was never entered on this connection
     hudPriorModeRef.current = null;
     sendVoiceControl("speaker", { on: false });
+    sendVoiceControl("spoken_confirm", { on: false });
     sendVoiceControl("mode", { on: prior });
     if (speakingRef.current) {
       playbackRef.current?.silenceNow();
