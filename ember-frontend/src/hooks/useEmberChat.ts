@@ -181,6 +181,13 @@ export function useEmberChat() {
             lastEvent: msg.event,
             speaking: msg.event === "stopped" ? false : prev.speaking,
           }));
+          // "Ember, you there?" (regular use): the server already turned voice mode on; open the HUD.
+          // Its prior mode is "off", so closing the HUD returns to normal wake-word use. The HUD
+          // itself has no timeouts — it stays until it is closed.
+          if (msg.event === "session_start" && hudPriorModeRef.current === null) {
+            hudPriorModeRef.current = false;
+            void window.emberHud?.open();
+          }
           break;
         case "voice_warning":
           setVoiceStatus((prev) => ({ ...prev, warning: msg.text }));

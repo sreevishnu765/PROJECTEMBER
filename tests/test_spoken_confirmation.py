@@ -101,5 +101,101 @@ class VoiceConfirmTests(unittest.TestCase):
         self.assertEqual(got, [])
 
 
+
+class SessionFlowTests(unittest.TestCase):
+    """Regular use: wake + query -> reply -> 7s window -> offline; 'thank you' ends it early.
+    Voice mode / HUD: no window, no timeouts, no offline state."""
+
+    def rig(self):
+        r = Rig()
+        self.addCleanup(r.close)
+        return r
+
+    def settle(self, r, seconds=5.0):
+        r.wait(lambda: r.v._tts_inflight == 0)
+        r.advance(seconds)
+
+    def reply_once(self, r):
+        r.say("hey ember what time is it")
+        r.reply("It is noon, sir.", final="It is noon, sir.")
+
+    def test_follow_up_window_is_seven_seconds(self):
+        r = self.rig()
+        self.reply_once(r)
+        r.wait(lambda: r.v._tts_inflight == 0)
+        r.advance(1.0)
+        r.now[0] = r.v._speaking_until + 6.5
+        r.say("and tomorrow")
+        self.assertEqual(r.of("transcript")[-1]["trigger"], "follow_up")
+
+    def test_offline_after_window_needs_wake_word(self):
+        r = self.rig()
+        self.reply_once(r)
+        self.settle(r, 30.0)
+        n = len(r.submitted)
+        r.say("and tomorrow")
+        self.assertEqual(len(r.submitted), n)
+        r.say("hey ember and tomorrow")
+        self.assertEqual(len(r.submitted), n + 1)
+
+    def test_thank_you_ends_the_window_without_asking_the_model(self):
+        r = self.rig()
+        self.reply_once(r)
+        self.settle(r, 1.0)
+        n = len(r.submitted)
+        r.say("thank you")
+        self.assertEqual(len(r.submitted), n)
+        self.settle(r, 1.0)
+        r.say("one more thing")
+        self.assertEqual(len(r.submitted), n)
+
+    def test_you_there_in_regular_use_turns_on_voice_mode_and_asks_for_the_hud(self):
+        r = self.rig()
+        r.say("ember, you there?")
+        self.assertEqual(r.submitted, [])
+        self.assertTrue(r.v._voice_mode)
+        self.assertTrue(r.of("voice_event", event="session_start"))
+        self.assertTrue(r.of("voice_event", event="voice_mode_on"))
+
+    def test_voice_mode_has_no_timeout(self):
+        r = self.rig()
+        r.say("ember, you there?")
+        self.settle(r, 1.0)
+        self.settle(r, 600.0)              # ten minutes of silence
+        r.v._refresh_state()
+        self.assertTrue(r.v._voice_mode)
+        r.say("what time is it")           # still no wake word needed
+        self.assertEqual(r.submitted, ["what time is it"])
+
+    def test_thank_you_in_voice_mode_does_not_go_offline(self):
+        r = self.rig()
+        r.v.set_voice_mode(True, announce=False)
+        r.say("thank you very much sir")
+        self.assertTrue(r.v._voice_mode)
+        self.settle(r, 1.0)
+        r.say("what time is it")
+        self.assertEqual(r.submitted[-1], "what time is it")
+
+    def test_you_there_when_already_in_voice_mode_just_answers(self):
+        r = self.rig()
+        r.v.set_voice_mode(True, announce=False)
+        r.say("you there?")
+        self.assertEqual(r.submitted, [])
+        self.assertFalse(r.of("voice_event", event="session_start"))
+
+
+class SessionTextTests(unittest.TestCase):
+    def test_closing_and_presence_phrases(self):
+        from ember_voice_text import is_closing_phrase, is_presence_check
+        for t in ["Thank you.", "okay thanks", "thanks a lot ember", "that's all", "thank you very much, sir"]:
+            self.assertTrue(is_closing_phrase(t), t)
+        for t in ["thank you, what's the weather", "no thanks", "thanks for that report"]:
+            self.assertFalse(is_closing_phrase(t), t)
+        for t in ["you there?", "Ember, you there?", "are you still there", "can you hear me"]:
+            self.assertTrue(is_presence_check(t), t)
+        for t in ["where are you", "who is there", "are you there to help me with homework"]:
+            self.assertFalse(is_presence_check(t), t)
+
+
 if __name__ == "__main__":
     unittest.main()

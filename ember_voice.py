@@ -125,7 +125,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from ember_voice_text import (
-    parse_confirmation_reply,
+    is_closing_phrase, is_presence_check, parse_confirmation_reply,
     SentenceChunker, detect_wake, is_stop_command, is_stt_garbage,
     looks_like_echo, name_aliases, parse_voice_mode_command, soft_wake_vetoed, strip_wake_residue,
 )
@@ -185,7 +185,9 @@ if DEFAULT_VOICE not in VOICES:
 
 @dataclass
 class VoiceConfig:
-    follow_up_seconds: float = 6.0     # window after a spoken reply where no wake phrase is needed
+    follow_up_seconds: float = 7.0     # window after a spoken reply where no wake phrase is needed
+    closing_ack: str = "You're welcome, sir."   # said after "thank you" in regular (wake-word) use
+    presence_ack: str = "Here, sir."            # said to "Ember, you there?"
     wake_window_seconds: float = 8.0   # window after a bare "hey Ember"
     ack_phrase: str = "Sir?"           # spoken when addressed with nothing after the wake phrase
     speak_status: bool = True          # speak "Searching for that, sir..." notes (once per reply)
@@ -1818,7 +1820,15 @@ class VoiceSession:
         rms = float(np.sqrt(np.mean(np.square(full_audio)))) if len(full_audio) else 0.0
         self._cur_stats = (20.0 * np.log10(max(rms, 1e-6)), float(np.abs(full_audio).max()) if len(full_audio) else 0.0, speech_ratio)
         self._cur_audio = full_audio
-        if not text or is_stt_garbage(text):
+        # Whisper invents "Thank you." out of silence/noise, so is_stt_garbage drops it everywhere
+        # else. But a real "thank you" is how the person ends a conversation, so it is let through
+        # while the regular follow-up window is open AND the clip is solid speech, not noise.
+        closing_ok = (
+            bool(text) and is_closing_phrase(text)
+            and not self._voice_mode and self._clock() < self._awake_until
+            and speech_ratio >= 0.35 and len(full_audio) >= 0.4 * MIC_SAMPLE_RATE
+        )
+        if not text or (is_stt_garbage(text) and not closing_ok):
             self._report(text, "dropped (empty/garbage)")
             return
 
@@ -1879,6 +1889,23 @@ class VoiceSession:
             return
         self._accept_command(command.strip(), trigger)
 
+    # ------------------------------------------------------------------ "Ember, you there?"
+    def _presence_check(self) -> None:
+        """Answered locally, never sent to the model. From regular wake-word use it is a feature
+        trigger: voice mode goes on and the client opens the HUD (voice_event session_start).
+        If voice mode is already on (the HUD is open) it is just answered."""
+        if self._is_speaking() or self._turn_active():
+            self.interrupt()
+            if self._turn_active():
+                self._answer_confirmation(False)
+                self._cancel_turn()
+        already_on = self._voice_mode
+        if not already_on:
+            self.set_voice_mode(True, announce=False)
+            self._send({"type": "voice_event", "event": "session_start"})
+        self._say(self.config.presence_ack)
+        self._refresh_state(force=True)
+
     def _on_bare_wake(self) -> None:
         if self._is_speaking() or self._turn_active():
             self.interrupt()
@@ -1898,6 +1925,29 @@ class VoiceSession:
             if vm == "off":
                 with self._lock:
                     self._awake_until = 0.0
+            return
+
+        if is_closing_phrase(command) and not self._voice_mode:
+            # Regular (wake-word) use only: "thank you" ends the follow-up window and she is
+            # offline again until the wake word. Voice mode / the HUD has no timeouts and no
+            # offline state, so there it is just an ordinary message.
+            busy_now = self._is_speaking() or self._turn_active()
+            self._log(f"closing phrase ({trigger}) - window closed")
+            if busy_now:
+                self.interrupt()
+                if self._turn_active():
+                    self._answer_confirmation(False)
+                    self._cancel_turn()
+            with self._lock:
+                self._awake_until = 0.0
+                self._awake_after_reply = False
+            if not busy_now:
+                self._say(self.config.closing_ack)
+            self._refresh_state(force=True)
+            return
+        if is_presence_check(command):
+            self._log(f"presence check ({trigger})")
+            self._presence_check()
             return
 
         busy = self._is_speaking() or self._turn_active()

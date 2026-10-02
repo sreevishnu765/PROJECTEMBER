@@ -562,6 +562,42 @@ def parse_voice_mode_command(text: str) -> "str | None":
     return None
 
 
+# "thank you" closes the conversation: no reply from the model, no more listening window, and the
+# session goes offline (the wake word is needed again). Full-string anchored on purpose — "thank you,
+# now what's the weather" is a normal command that merely starts politely.
+_CLOSING_RE = re.compile(
+    r"^(?:ok(?:ay)? |alright |great |cool |perfect |nice |cheers )*"
+    r"(?:(?:thank you|thankyou|thank u|thanks|thx|cheers)(?: (?:so|very|ever so))?(?: much| a lot| a ton| again| ember| mate)*"
+    r"|that'?s (?:all|it)(?: (?:for now|thanks|thank you))?|that will be all|that'?ll be all|all done|i'?m done|we'?re done)"
+    r"(?: (?:for now|thanks|thank you|ember))*$"
+)
+
+
+def _plain(text: str) -> str:
+    """Like _normalize but keeps "thanks"/"thank you" (those are the content here)."""
+    t = re.sub(r"[^a-z0-9' ]+", " ", (text or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    return re.sub(r"(?: (?:sir|please))+$", "", t)
+
+
+def is_closing_phrase(text: str) -> bool:
+    return bool(_CLOSING_RE.match(_plain(text)))
+
+
+# "Ember, you there?" — a presence check. It is answered locally ("Here, sir."), never sent to the
+# model, and (via the session_start event) opens the HUD for a hands-free conversation.
+_PRESENCE_RE = re.compile(
+    r"^(?:hey |hi |hello |ember )*"
+    r"(?:(?:are )?you (?:still )?(?:there|here|awake|up|online|listening|with me|around)"
+    r"|can you hear me|do you hear me|(?:you )?(?:still )?with me)"
+    r"(?: (?:now|ember|ok|okay))*$"
+)
+
+
+def is_presence_check(text: str) -> bool:
+    return bool(_PRESENCE_RE.match(_normalize(text)))
+
+
 _STOP_RE = re.compile(
     r"^(?:stop|quiet|be quiet|shut up|cancel|enough|that'?s enough|stop talking|never ?mind|hold on|wait)$"
 )
