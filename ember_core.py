@@ -813,15 +813,43 @@ def _register_builtin_tools() -> None:
 
     def _forget_specific(match):
         query = _strip_trailing_address(match.group(1).strip().strip(".!?"))
+        # Display form only ("that i am watching X" -> "watching X"); the
+        # matcher itself works on content words, so this is cosmetic.
+        query = re.sub(r"^(?:that\s+)?(?:i\s+said\s+|i\s+am\s+|i'?m\s+|i\s+)?", "", query, flags=re.IGNORECASE).strip() or query
         if not query:
             return "Forget what specifically, sir?"
-        deleted = memory.forget(query)
+        deleted = memory.forget(query, embed_fn=llm_client.embed)
         if not deleted:
             return f"Nothing matching '{query}' was in memory, sir."
         lines = "\n".join(f"  - {d['text']}" for d in deleted)
         return f"Forgot {len(deleted)} matching memory(ies), sir:\n{lines}"
 
     registry.register("forget_memory", "Deletes memories matching a text query", _FORGET_SPECIFIC_RE.pattern, _forget_specific, destructive=True)
+
+    # ---- Speech vocabulary (see ember_stt_adapt.py) ------------------------
+    # "when you hear max will stop I mean Verstappen" / "add Verstappen to your vocabulary".
+    _TEACH_HEARD_RE = r"\bwhen\s+(?:i\s+say|you\s+hear|you\s+hear\s+me\s+say)\s+[\"']?(.+?)[\"']?,?\s+(?:i\s+mean|it\s+means|i\s+said|i\s+meant)\s+[\"']?(.+?)[\"']?\s*[.!]?\s*$"
+    _TEACH_TERM_RE = r"\badd\s+[\"']?(.+?)[\"']?\s+to\s+(?:your\s+|the\s+|my\s+)?(?:speech\s+|voice\s+)?(?:vocabulary|dictionary|word\s*list)\b"
+
+    def _teach_heard(match):
+        from ember_stt_adapt import get_vocabulary
+        heard = _strip_trailing_address(match.group(1)).strip()
+        meant = _strip_trailing_address(match.group(2)).strip()
+        if not heard or not meant:
+            return "Teach me what, sir? Say: when you hear X, I mean Y."
+        status = get_vocabulary().add(term=meant, heard=heard)
+        return f"Noted, sir — when I hear '{heard}' I'll write '{meant}'." if status == "added" else f"Couldn't save that, sir: {status}."
+
+    def _teach_term(match):
+        from ember_stt_adapt import get_vocabulary
+        term = _strip_trailing_address(match.group(1)).strip()
+        status = get_vocabulary().add(term=term)
+        if status == "added":
+            return f"Added '{term}' to my speech vocabulary, sir."
+        return f"'{term}' is already in my vocabulary, sir." if status == "already there" else f"Couldn't save that, sir: {status}."
+
+    registry.register("teach_speech_correction", "Teaches the speech recogniser a mishearing", _TEACH_HEARD_RE, _teach_heard)
+    registry.register("teach_speech_term", "Adds a word to the speech vocabulary", _TEACH_TERM_RE, _teach_term)
 
     def _cancel_reminder(match):
         reminder_id = match.group(1)
@@ -1281,7 +1309,7 @@ def _register_builtin_queries() -> None:
         query = (params.get("query") or "").strip()
         if not query:
             raise ValueError("memory_forget requires a non-empty 'query' param.")
-        deleted = memory.forget(query)
+        deleted = memory.forget(query, embed_fn=llm_client.embed)
         return {"deleted": deleted, "count": len(deleted)}
 
     registry.register(

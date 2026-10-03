@@ -141,6 +141,14 @@ STT_PROMPT = os.environ.get("EMBER_STT_PROMPT", "")
 # Biases Whisper towards spelling the wake word right. Costs nothing on real speech; set to "" to disable.
 STT_HOTWORDS = os.environ.get("EMBER_STT_HOTWORDS", "Ember")
 STT_BEAM = int(os.environ.get("EMBER_STT_BEAM", "1"))     # 1 = fastest; 5 is a little more accurate and slower
+# CPU threads for Whisper. faster-whisper's own default is 4, which leaves most of a modern laptop idle.
+STT_THREADS = int(os.environ.get("EMBER_STT_THREADS", str(min(8, max(4, (os.cpu_count() or 4) // 2 + 1)))))
+# Whisper's default is to RE-DECODE a clip at higher temperatures whenever its first pass looks low-confidence
+# (up to 6 extra passes) — exactly what accented or unusual speech triggers, and why some utterances take far
+# longer than others. One greedy pass by default; EMBER_STT_FALLBACK=1 restores Whisper's retry behaviour.
+STT_FALLBACK = os.environ.get("EMBER_STT_FALLBACK", "0") not in ("", "0")
+# Your own vocabulary + fixed corrections (see ember_stt_adapt.py). EMBER_STT_ADAPT=0 turns it off.
+STT_ADAPT = os.environ.get("EMBER_STT_ADAPT", "1") not in ("", "0")
 
 # TTS engine: "auto" (Piper if its voices are installed, else Kokoro), "piper", or "kokoro".
 # Piper is ~5-10x faster on CPU; Kokoro sounds a little nicer but can run slower than real time
@@ -205,7 +213,7 @@ class VoiceConfig:
     # Bursts with less speech than this are discarded before Whisper ever sees them. Lowered from 250 so a quick,
     # faint "Ember" survives (EMBER_VAD_MIN_SPEECH_MS to change it; door slams and clicks are still filtered).
     min_speech_ms: int = field(default_factory=lambda: int(os.environ.get("EMBER_VAD_MIN_SPEECH_MS", "160")))
-    end_silence_ms: int = field(default_factory=lambda: int(os.environ.get("EMBER_VAD_END_SILENCE_MS", "700")))
+    end_silence_ms: int = field(default_factory=lambda: int(os.environ.get("EMBER_VAD_END_SILENCE_MS", "550")))
     max_utterance_s: float = 20.0
     pre_roll_ms: int = 320
     # How long a barge-in waits for a cancelled turn to unwind before giving up and saying
@@ -877,6 +885,9 @@ class WhisperSTT:
         self._name = model_name
         self._prompt = prompt or None
         self._hotwords = STT_HOTWORDS if hotwords is None else hotwords
+        # An explicit hotwords="" means "bias off" (voice_tune.py compares settings this way) — that has to
+        # switch the personal vocabulary off too, or the comparison would still be biased.
+        self._vocab_enabled = hotwords != ""
         self._beam = STT_BEAM if beam_size is None else beam_size
         self._model = None
         self._lock = threading.Lock()
@@ -885,24 +896,47 @@ class WhisperSTT:
         """Change hotwords/beam without reloading the model (used by voice_tune.py's comparisons)."""
         if hotwords is not None:
             self._hotwords = hotwords
+            self._vocab_enabled = hotwords != ""
         if beam_size is not None:
             self._beam = beam_size
 
     def _load(self):
         if self._model is None:
             from faster_whisper import WhisperModel
-            self._model = WhisperModel(
-                self._name, device="cpu", compute_type="int8",
-                download_root=os.path.join(MODELS_DIR, "whisper"),
-            )
+            try:
+                self._model = WhisperModel(
+                    self._name, device="cpu", compute_type="int8", cpu_threads=STT_THREADS,
+                    download_root=os.path.join(MODELS_DIR, "whisper"),
+                )
+            except TypeError:                      # older faster-whisper without cpu_threads
+                self._model = WhisperModel(
+                    self._name, device="cpu", compute_type="int8",
+                    download_root=os.path.join(MODELS_DIR, "whisper"),
+                )
         return self._model
 
     def transcribe(self, audio: np.ndarray) -> str:
         audio = normalize_for_stt(audio)
+        vocab = None
+        if STT_ADAPT and self._vocab_enabled:
+            try:
+                from ember_stt_adapt import get_vocabulary
+                vocab = get_vocabulary()
+            except Exception as e:
+                print(f"[ember_voice] vocabulary unavailable ({e}); transcribing without it.")
+        prompt = self._prompt or ((vocab.prompt() or None) if vocab else None)
+        seen, words = set(), []
+        for w in f"{self._hotwords} {vocab.hotwords() if vocab else ''}".split():
+            if w.lower() not in seen:
+                seen.add(w.lower())
+                words.append(w)
+        hotwords = " ".join(words)
         kwargs = dict(language="en", beam_size=self._beam, vad_filter=False, condition_on_previous_text=False,
-                      without_timestamps=True, initial_prompt=self._prompt)
-        if self._hotwords:
-            kwargs["hotwords"] = self._hotwords
+                      without_timestamps=True, initial_prompt=prompt)
+        if not STT_FALLBACK:
+            kwargs["temperature"] = 0.0
+        if hotwords:
+            kwargs["hotwords"] = hotwords
         with self._lock:
             model = self._load()
             try:
@@ -917,7 +951,10 @@ class WhisperSTT:
                 if getattr(seg, "no_speech_prob", 0.0) > 0.6 and getattr(seg, "avg_logprob", 0.0) < -1.0:
                     continue
                 parts.append(seg.text.strip())
-        return " ".join(p for p in parts if p).strip()
+        text = " ".join(p for p in parts if p).strip()
+        if text.lower().startswith("glossary:"):       # Whisper echoing its own prompt back out of silence/noise
+            return ""
+        return vocab.correct(text) if (vocab and text) else text
 
 
 class VoiceEngines:

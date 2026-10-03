@@ -258,7 +258,8 @@ class WhisperWrapperTests(unittest.TestCase):
     def test_defaults_and_overrides(self):
         stt = self.wrapper()
         stt.transcribe(np.ones(1600, dtype=np.float32) * 0.1)
-        self.assertEqual(stt._model.calls[-1]["hotwords"], "Ember")
+        self.assertEqual(stt._model.calls[-1]["hotwords"].split()[0], "Ember")      # wake word first, then the personal vocabulary
+        self.assertEqual(stt._model.calls[-1]["temperature"], 0.0)
         self.assertEqual(stt._model.calls[-1]["beam_size"], 1)
         stt.set_options(hotwords="", beam_size=5)
         stt.transcribe(np.ones(1600, dtype=np.float32) * 0.1)

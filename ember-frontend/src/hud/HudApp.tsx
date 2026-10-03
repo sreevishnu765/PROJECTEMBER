@@ -81,7 +81,7 @@ function TurnCard({ turn }: { turn: HudTurn }) {
   return (
     <div className={`flex animate-riseIn ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`hud-text relative max-w-[88%] px-3.5 py-2.5 text-[13.5px] leading-relaxed ${
+        className={`hud-text relative min-w-0 max-w-[88%] px-3.5 py-2.5 text-[13.5px] leading-relaxed ${
           isUser
             ? "rounded-[14px_4px_14px_14px] border border-[#60A5FA]/45 bg-[#16295F] text-[#DCE9FF]"
             : "rounded-[4px_14px_14px_14px] border border-[#7DD3FC]/50 bg-[#0F3550] text-[#EAF6FF]"

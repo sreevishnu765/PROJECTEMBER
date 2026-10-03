@@ -58,6 +58,7 @@ body {
 }
 
 .ember-prose {
+  overflow-wrap: anywhere;
   font-size: 15px;
   line-height: 1.7;
   color: #e9edf2;
@@ -158,6 +159,9 @@ html.hud #root {
 }
 .hud-text {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+  /* long unbroken strings (Windows paths, URLs) must wrap inside the bubble, not spill out of it */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .hud-prose > * + * {
   margin-top: 0.5em;

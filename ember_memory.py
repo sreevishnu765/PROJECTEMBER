@@ -69,6 +69,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+import re
 
 DECAY_HALF_LIFE_DAYS = 30.0
 SIMILARITY_FLOOR = 0.3
@@ -78,6 +79,61 @@ EMBED_CHAR_LIMIT = 2048
 # above. source_tag is what lets recall() avoid comparing vectors from
 # different embedding models/dimensions.
 EmbedFn = Callable[[str], Optional["tuple[list[float], str]"]]
+
+
+# ---- Fuzzy matching helpers (forget / keyword recall) ----------------------
+# Real bug: forget() was a raw substring LIKE, so "forget that i am watching
+# the mentalist" looked for that exact sentence inside "...working your way
+# through The Mentalist" and found nothing, even though the memory was right
+# there (and visible in the Memory tab). Matching now works on content
+# words (filler dropped, light stemming) instead of exact character runs.
+_WORD_RE = re.compile(r"[a-z0-9']+")
+_FILLER = {
+    "a", "an", "the", "that", "this", "these", "those", "i", "im", "i'm", "ive", "i've", "me", "my", "mine",
+    "we", "our", "you", "your", "he", "she", "it", "its", "they", "their", "is", "am", "are", "was", "were",
+    "be", "been", "being", "do", "does", "did", "of", "to", "in", "on", "at", "for", "with", "about", "and",
+    "or", "but", "so", "as", "by", "from", "up", "just", "now", "also", "very", "really", "please",
+    "forget", "remember", "said", "say", "told", "tell", "ember", "sir", "fact", "thing", "stuff",
+    "way", "through", "currently", "right", "today", "user", "s",
+}
+# Words that appear in many unrelated memories ("likes X", "watching Y"):
+# they may help a match but can never be the only thing that makes one.
+_GENERIC = {
+    "like", "love", "hate", "prefer", "live", "work", "watch", "play", "use", "go", "get", "have", "has",
+    "had", "favorite", "favourite", "name", "call", "own", "want", "need", "know", "think", "start",
+    "current", "also", "new", "old", "time", "day",
+}
+
+
+def _stem(w: str) -> str:
+    w = w.strip("'")
+    if w.endswith("'s"):
+        w = w[:-2]
+    for suf in ("ing", "ies", "ed", "es", "s"):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            w = w[: -len(suf)] + ("y" if suf == "ies" else "")
+            break
+    return w
+
+
+def content_tokens(text: str) -> "set[str]":
+    return {_stem(w) for w in _WORD_RE.findall((text or "").lower()) if w not in _FILLER and len(w) > 1}
+
+
+def lexical_match(query_tokens: "set[str]", text: str) -> "float | None":
+    """Returns a 0-1 score if `text` plausibly refers to the same thing as
+    the query, else None. Needs the DISTINCTIVE (non-generic) query words
+    to be mostly present, so "watching the mentalist" matches a memory
+    about The Mentalist but not one about watching Dune."""
+    if not query_tokens:
+        return None
+    mem_tokens = content_tokens(text)
+    distinctive = {t for t in query_tokens if t not in _GENERIC} or query_tokens
+    hit = distinctive & mem_tokens
+    need = max(1, math.ceil(0.6 * len(distinctive)))
+    if len(hit) < need:
+        return None
+    return len(hit) / len(distinctive)
 
 
 @dataclass
@@ -362,27 +418,59 @@ class EmberMemory:
             cur = self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             return cur.rowcount > 0
 
-    def forget(self, text_query: str, limit: int = 5) -> "list[dict]":
-        """Explicit forget: deletes memories whose text contains
-        `text_query` (case-insensitive substring match — deliberately
-        simple and predictable, not semantic, so 'forget about the trip'
-        doesn't accidentally sweep up unrelated rows a similarity score
-        happened to like). Returns the list of deleted rows (id + text)
-        so the caller can tell the user exactly what was removed rather
-        than just a count — an explicit-forget command should be
-        auditable, not a black box the same way clear_all() bulk-deletes
-        blindly (that one is fine precisely because it's total and
-        confirmed; a *selective* forget needs to show its work)."""
-        q = f"%{text_query.strip().lower()}%"
+    FORGET_SEMANTIC_THRESHOLD = 0.78  # deliberately high: a wrong delete is worse than a miss; first guess, not tuned
+
+    def find_forget_matches(self, text_query: str, embed_fn: "EmbedFn | None" = None, limit: int = 5) -> "list[dict]":
+        """Ranked memories that plausibly match `text_query`. Three ways to
+        match, best score wins per row: (1) the old exact-substring check,
+        (2) content-word overlap (see lexical_match), (3) embedding
+        similarity >= FORGET_SEMANTIC_THRESHOLD when embed_fn works.
+        Nothing is deleted here."""
+        q = (text_query or "").strip().lower()
+        if not q:
+            return []
+        qtokens = content_tokens(q)
+        with self._lock:
+            rows = self._conn.execute("SELECT id, text, embedding, embed_source FROM memories").fetchall()
+
+        query_vec = query_src = None
+        if embed_fn is not None:
+            try:
+                res = embed_fn(text_query)
+                if res is not None:
+                    query_vec, query_src = res
+            except Exception:
+                pass
+
+        scored = []
+        for mem_id, text, emb_json, emb_src in rows:
+            score = 0.0
+            if q in text.lower():
+                score = 1.0
+            lex = lexical_match(qtokens, text)
+            if lex is not None:
+                score = max(score, 0.6 + 0.3 * lex)
+            if query_vec is not None and emb_json and emb_src == query_src:
+                sim = self._cosine(query_vec, json.loads(emb_json))
+                if sim >= self.FORGET_SEMANTIC_THRESHOLD:
+                    score = max(score, sim)
+            if score > 0:
+                scored.append((score, mem_id, text))
+        scored.sort(key=lambda r: r[0], reverse=True)
+        return [{"id": i, "text": t, "score": round(sc, 3)} for sc, i, t in scored[:limit]]
+
+    def forget(self, text_query: str, limit: int = 5, embed_fn: "EmbedFn | None" = None) -> "list[dict]":
+        """Explicit forget. Matches by meaning-bearing words (and
+        embeddings when embed_fn is given), not by exact characters, so
+        'forget that i am watching the mentalist' finds 'Currently
+        working through The Mentalist'. Returns the deleted rows (id +
+        text) so the caller can show exactly what was removed."""
+        matches = self.find_forget_matches(text_query, embed_fn=embed_fn, limit=limit)
+        if not matches:
+            return []
         with self._lock, self._conn:
-            rows = self._conn.execute(
-                "SELECT id, text FROM memories WHERE lower(text) LIKE ? LIMIT ?",
-                (q, limit),
-            ).fetchall()
-            if rows:
-                ids = [r[0] for r in rows]
-                self._conn.executemany("DELETE FROM memories WHERE id = ?", [(i,) for i in ids])
-        return [{"id": r[0], "text": r[1]} for r in rows]
+            self._conn.executemany("DELETE FROM memories WHERE id = ?", [(m["id"],) for m in matches])
+        return [{"id": m["id"], "text": m["text"]} for m in matches]
 
     def clear_all(self) -> int:
         with self._lock, self._conn:
@@ -595,11 +683,13 @@ class EmberMemory:
         )
 
     def _keyword_recall(self, query: str, rows, n: int, reason: str) -> RecallResult:
-        q_words = set(query.lower().split())
+        # Content-word overlap with light stemming ("watching" ~ "watch"),
+        # not exact whole-word equality on the raw sentence.
+        q_tokens = content_tokens(query)
         scored = []
         for row in rows:
             mem_id, text = row[0], row[1]
-            overlap = len(q_words & set(text.lower().split()))
+            overlap = len(q_tokens & content_tokens(text))
             if overlap:
                 scored.append((overlap, mem_id, text))
         if not scored:
