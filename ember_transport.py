@@ -98,6 +98,7 @@ import json
 import os
 import secrets
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -109,6 +110,32 @@ from ember_query_registry import get_query_registry
 from ember_attachments import save_attachments, default_upload_dir
 
 AUTH_TOKEN_ENV = "EMBER_TRANSPORT_TOKEN"
+# Reminders that fire while NO client is connected are kept briefly and delivered (marked late) to the next
+# client that connects, instead of vanishing into the server console.
+_REMINDER_CLIENTS: "set[str]" = set()
+_MISSED_REMINDERS: "list[tuple[float, dict]]" = []
+MISSED_REMINDER_TTL_SECONDS = 6 * 3600
+_missed_lock = threading.Lock()
+
+
+def _remember_missed_reminder(event_type, payload) -> None:
+    if _REMINDER_CLIENTS:
+        return
+    with _missed_lock:
+        _MISSED_REMINDERS.append((time.time(), dict(payload or {})))
+        del _MISSED_REMINDERS[:-20]
+
+
+def _drain_missed_reminders() -> "list[dict]":
+    cutoff = time.time() - MISSED_REMINDER_TTL_SECONDS
+    with _missed_lock:
+        fresh = [p for t, p in _MISSED_REMINDERS if t >= cutoff]
+        _MISSED_REMINDERS.clear()
+    return fresh
+
+
+get_bus().subscribe("reminder.due", _remember_missed_reminder)
+
 AUTH_TIMEOUT_SECONDS = 10
 # websockets' own default is 1 MiB, which silently closes the connection on any
 # real chat attachment (files travel base64-encoded in one JSON message, ~1.33x
@@ -233,6 +260,43 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
             v.ask_confirmation(rid, confirmation_prompt(tool, payload.get("args")), _answered)
 
     bus.subscribe("confirmation.requested", _on_confirmation_requested)
+
+    # ---- Reminders and timers: delivered to the desktop and spoken aloud -----------------------------
+    # ember_reminders publishes "reminder.due" on the bus. Before this, only the server console heard it,
+    # so a reminder firing while you were in the app produced nothing you could see or hear.
+    async def _deliver_reminder(payload: dict) -> None:
+        """Runs on the event loop. Tells the client (so it can show a banner/notification) and speaks it."""
+        try:
+            from ember_reminders import display_message, reminder_speech
+            shown, spoken = display_message(payload.get("message", "")), reminder_speech(payload.get("message", ""))
+        except Exception:
+            shown = spoken = payload.get("message", "")
+        try:
+            await websocket.send(json.dumps({
+                "type": "reminder", "id": payload.get("id"), "message": shown, "spoken": spoken,
+                "priority": payload.get("priority"), "late": bool(payload.get("late")),
+            }))
+        except Exception as e:
+            print(f"[ember_transport] couldn't deliver reminder to {session_id}: {e}")
+            return
+        # Voice is created lazily on first use; a reminder must speak even if you never touched the mic
+        # button. Created off the event loop (it can load models). If voice can't run here, the banner
+        # above is still delivered.
+        v = voice if voice is not None else await asyncio.to_thread(_ensure_voice)
+        if v is not None:
+            v.announce(spoken)
+
+    def _on_reminder_due(event_type, payload):
+        asyncio.run_coroutine_threadsafe(_deliver_reminder(payload), loop)
+
+    bus.subscribe("reminder.due", _on_reminder_due)
+    _REMINDER_CLIENTS.add(session_id)
+    # Anything that fired while no client was connected is delivered now, marked late.
+    async def _deliver_missed():
+        await asyncio.sleep(1.5)        # let the client finish its own setup first
+        for missed in _drain_missed_reminders():
+            await _deliver_reminder({**missed, "late": True})
+    missed_task = asyncio.ensure_future(_deliver_missed())
 
     turn_task: "asyncio.Task | None" = None
     query_registry = get_query_registry()
@@ -462,6 +526,9 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
         if turn_task is not None and not turn_task.done():
             turn_task.cancel()
         bus.unsubscribe("confirmation.requested", _on_confirmation_requested)
+        bus.unsubscribe("reminder.due", _on_reminder_due)
+        missed_task.cancel()
+        _REMINDER_CLIENTS.discard(session_id)
         registry.close(session_id)
 
 

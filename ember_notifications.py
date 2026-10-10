@@ -77,7 +77,12 @@ class NotificationManager:
         bus.subscribe("google_auth.expiring_soon", self._on_google_auth_expiring)
 
     def _on_reminder_due(self, event_type: str, payload: dict) -> None:
-        self.notify(payload.get("message", ""), category="reminder", reminder_id=payload.get("id"), priority=payload.get("priority"))
+        try:
+            from ember_reminders import display_message
+            shown = display_message(payload.get("message", ""))
+        except Exception:
+            shown = payload.get("message", "")
+        self.notify(shown, category="reminder", reminder_id=payload.get("id"), priority=payload.get("priority"))
 
     def _on_proactive_message(self, event_type: str, payload: dict) -> None:
         message = payload.get("message", payload) if isinstance(payload, dict) else payload

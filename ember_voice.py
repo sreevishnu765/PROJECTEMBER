@@ -1432,6 +1432,12 @@ class VoiceSession:
         """Speak `text` immediately, independent of any reply in flight."""
         self._enqueue_speech(text, "say")
 
+    def announce(self, text: str) -> None:
+        """Speak an unprompted announcement (a reminder or timer firing). Queued behind anything already
+        being said rather than cutting it off, and independent of voice mode / the speaker toggle: a
+        reminder that only speaks when you happened to have voice switched on isn't a reminder."""
+        self._say(text)
+
     def _note_tts_speed(self, synth_seconds: float, audio_seconds: float) -> None:
         """If synthesis is running slower than playback, every chunk boundary is an
         audible pause. Say so once instead of leaving it as a mystery."""

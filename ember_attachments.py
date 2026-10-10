@@ -36,7 +36,8 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_BYTES = 15 * 1024 * 1024
 MAX_TEXT_CHARS = 12_000        # injected per file
 MAX_CONTEXT_CHARS = 24_000     # injected per turn, all files together
-STICKY_TURNS = 3
+STICKY_TURNS = 5
+MAX_WARM_BLOCKS = 3            # earlier attachments stay available next to the newest ("those images")
 
 BLOCKED_EXTS = {".exe", ".dll", ".msi", ".scr", ".com", ".bat", ".cmd", ".vbs", ".lnk"}
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -147,6 +148,42 @@ def _read_pdf(path: str) -> "tuple[str, str | None]":
         return "", f"couldn't read the PDF ({type(e).__name__})"
 
 
+VISION_GROUND_RULES = (
+    "Work only from what is visible. First list the concrete visible facts: objects, colours, condition, "
+    "any badges, logos or readable text (quote text exactly). If asked what something is and it is a "
+    "manufactured thing (car, device, part), name your best identification AND an honest confidence "
+    "(certain / probable / possible), name the specific visible features that support it and any that "
+    "argue against the closest alternatives, and say what extra view or detail would settle it. Do not "
+    "state a model year, generation or variant as fact unless a badge, text or unmistakable feature shows "
+    "it. Do not identify real people from their faces. If the image is cropped or unclear, say so."
+)
+
+
+def _vision_query(user_question: str) -> str:
+    """The user's question alone ("change of opinion?") tells a vision model nothing about what to look
+    at, and the main model never sees pixels -- only this description. So every image gets a thorough,
+    evidence-first description, with the question attached as the thing to answer."""
+    q = (user_question or "").strip()
+    head = "Describe this image thoroughly and extract any text in it."
+    if q:
+        head += f" The user's message with it was: {q!r}. Answer that too."
+    return f"{head}\n\n{VISION_GROUND_RULES}"
+
+
+_RECHECK_RE = re.compile(
+    r"\b(?:i\s+think|actually|are\s+you\s+sure|look\s+(?:again|closer)|take\s+another\s+look|re-?check|"
+    r"double[- ]check|wrong|not\s+(?:a|an|the|right|correct)|isn'?t\s+it|is\s+it\s+(?:a|an|the)|"
+    r"change\s+of\s+(?:opinion|mind)|reconsider|really|no,?\s+it)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_recheck(prompt: str) -> bool:
+    """A follow-up that disputes or questions an earlier reading of an attachment. For these the old
+    description is not enough -- the model must be shown the pixels' evidence again, with the dispute."""
+    return bool(_RECHECK_RE.search(prompt or ""))
+
+
 def _describe_one(att: dict, query: str, vision_call) -> str:
     path, kind = att["path"], att["kind"]
     if kind == "text":
@@ -164,7 +201,7 @@ def _describe_one(att: dict, query: str, vision_call) -> str:
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            q = query.strip() or "Describe this image and extract any text in it."
+            q = _vision_query(query)
             return "[vision analysis of the image]\n" + _clip(vision_call(raw, IMAGE_MIME.get(ext, "image/png"), q))
         except Exception as e:
             return f"[image attached, but vision analysis failed: {e}]"
@@ -184,29 +221,55 @@ def build_block(saved: list, query: str, vision_call=None) -> str:
     return _clip("\n".join(parts), MAX_CONTEXT_CHARS)
 
 
+def _combine(old_block: str, new_block: str) -> str:
+    """Keep earlier attachments readable beside the newest ones, within the context cap, newest first."""
+    return _clip(new_block + "\n\n(Earlier attachment(s) from this conversation:)\n" + old_block, MAX_CONTEXT_CHARS)
+
+
 def augment_prompt(prompt: str, conversation, vision_call=None, status_fn=None, on_saved=None) -> str:
     """Called by ember_core.process_turn once the turn's prompt is final.
     New attachments (conversation.attachments, set by the transport) are
-    read and injected; otherwise a still-warm block from a recent turn is
-    re-injected so follow-up questions keep working."""
+    read and injected, alongside any still-warm earlier ones; otherwise a
+    still-warm block from a recent turn is re-injected so follow-up
+    questions keep working. When a follow-up disputes or questions an
+    earlier image reading, the saved image is looked at again with the
+    dispute as the question."""
     pending = getattr(conversation, "attachments", None)
     if pending:
         conversation.attachments = None
         if status_fn:
             status_fn("Reading the attached file(s), sir...")
         block = build_block(pending, prompt[:500], vision_call)
-        conversation.attachment_context = [block, STICKY_TURNS]
+        warm = getattr(conversation, "attachment_context", None)
+        combined = _combine(warm[0], block) if warm else block
+        conversation.attachment_context = [combined, STICKY_TURNS]
+        files = list(getattr(conversation, "attachment_files", None) or [])
+        conversation.attachment_files = (pending + files)[:MAX_FILES_PER_MESSAGE]
         if on_saved:
             for att in pending:
                 on_saved(att)
-        return f"{prompt}\n\n{block}"
+        return f"{prompt}\n\n{combined}"
 
     ctx = getattr(conversation, "attachment_context", None)
     if ctx:
         block, turns_left = ctx
+        files = [a for a in (getattr(conversation, "attachment_files", None) or []) if a.get("kind") == "image"]
+        if vision_call is not None and files and wants_recheck(prompt):
+            if status_fn:
+                status_fn("Taking another look at the image, sir...")
+            fresh = build_block(files, f"The user is disputing or questioning the earlier reading: {prompt[:400]}. "
+                                       "Re-examine the image. Give the visible evidence for and against their "
+                                       "suggestion, and say whether it is supported, plausible, or contradicted.",
+                                vision_call)
+            block = _combine(block, "[RE-EXAMINATION requested by the user's follow-up]\n" + fresh)
+            ctx = [block, turns_left]
+            conversation.attachment_context = ctx
         if turns_left <= 1:
             conversation.attachment_context = None
+            conversation.attachment_files = None
         else:
             conversation.attachment_context = [block, turns_left - 1]
-        return f"{prompt}\n\n(Earlier attachment(s) still in play for this conversation:)\n{block}"
+        return (f"{prompt}\n\n(Earlier attachment(s) still in play for this conversation. The descriptions below "
+                f"come from a separate vision model, not your own eyes: weigh the user's view against the described "
+                f"evidence instead of defending the first reading for its own sake.)\n{block}")
     return prompt

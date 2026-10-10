@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
-DEFAULT_POLL_SECONDS = 20
+DEFAULT_POLL_SECONDS = 5   # was 20; a 30-second timer must not fire up to 20s late. The check is a local list scan, so this costs nothing.
 
 _TIME_OF_DAY_DEFAULTS = {
     "tonight": (20, 0),
@@ -70,8 +70,48 @@ _TIME_OF_DAY_DEFAULTS = {
 # "evening" substring inside it would.
 _TIME_OF_DAY_KEYS_ORDERED = sorted(_TIME_OF_DAY_DEFAULTS.keys(), key=len, reverse=True)
 
+# "in 3 hours and 40 minutes", "in an hour and a half", "in 2 and a half hours", "in half an hour", "in 90 min".
+# The old pattern only knew "in <digits> <unit>", so "in 3 hours and 40 minutes" matched just "in 3 hours" and
+# the rest ("and 40 minutes to wake up") became the reminder's TEXT.
+_NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+              "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30,
+              "forty": 40, "forty-five": 45, "fifty": 50, "sixty": 60, "ninety": 90}
+_DUR_NUM = r"(?:\d+(?:\.\d+)?|half(?:\s+an?)?|" + "|".join(sorted(_NUM_WORDS, key=len, reverse=True)) + r")"
+_DUR_UNIT = r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)"
+_DUR_ONE = rf"{_DUR_NUM}(?:\s+and\s+a\s+half)?\s*-?\s*{_DUR_UNIT}"
+_DURATION_PHRASE = rf"in\s+{_DUR_ONE}(?:\s*(?:,|and|&)?\s*{_DUR_ONE})*(?:\s+and\s+a\s+half)?"
+_DUR_PART_RE = re.compile(rf"({_DUR_NUM})(\s+and\s+a\s+half)?\s*-?\s*({_DUR_UNIT})", re.IGNORECASE)
+
+
+def parse_duration_seconds(text: str) -> "int | None":
+    """Total seconds in a duration phrase ("3 hours and 40 minutes" -> 13200), or None if there is none."""
+    parts = _DUR_PART_RE.findall((text or "").lower())
+    if not parts:
+        return None
+    total = 0.0
+    for qty, and_half, unit in parts:
+        qty = qty.strip()
+        if qty.startswith("half"):
+            n = 0.5
+        elif qty in _NUM_WORDS:
+            n = float(_NUM_WORDS[qty])
+        else:
+            try:
+                n = float(qty)
+            except ValueError:
+                continue
+        if and_half:
+            n += 0.5
+        per = 3600 if unit.startswith(("hour", "hr")) else 60 if unit.startswith(("min",)) else 1
+        total += n * per
+    tail = re.search(r"(?:hours?|hrs?|minutes?|mins?)\s+and\s+a\s+half\s*$", (text or "").lower())
+    if tail and not and_half:                       # "an hour and a half": the half belongs to the LAST unit
+        total += (1800 if tail.group(0).startswith(("hour", "hr")) else 30)
+    return int(total) if total > 0 else None
+
+
 TIME_PHRASE_RE = re.compile(
-    r"\b(in\s+\d+\s*(?:minute|min|hour|hr)s?"
+    r"\b(" + _DURATION_PHRASE +
     # Day-word phrases (tomorrow/tonight/this evening/...) can optionally
     # be followed by a specific clock time — "tomorrow at 6 PM", "tonight
     # at 9" — and both pieces MUST be captured as one match. Before this
@@ -164,12 +204,11 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
     except ValueError:
         pass
 
-    m = re.search(r"\bin\s+(\d+)\s*(minute|min|hour|hr)s?\b", phrase)
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2)
-        delta = timedelta(hours=n) if unit.startswith("hour") or unit == "hr" else timedelta(minutes=n)
-        return now + delta, ""
+    dm = re.search(_DURATION_PHRASE, phrase)
+    if dm:
+        seconds = parse_duration_seconds(dm.group(0))
+        if seconds:
+            return now + timedelta(seconds=seconds), ""
 
     is_day_after_tomorrow = "day after tomorrow" in phrase
     # Real bug: "day after tomorrow" contains the substring "tomorrow",
@@ -407,3 +446,130 @@ class ReminderStore:
 
     def stop(self):
         self._stop_event.set()
+
+# ---- Timers and spoken delivery -------------------------------------------
+# A timer is an ordinary one-shot reminder whose message carries this marker, so it needs no new storage,
+# survives a restart, and shows up in "list my reminders". reminder_speech() is what the desktop client's
+# voice says when it fires.
+TIMER_MARKER = "[timer] "
+
+
+def make_timer_message(duration_text: str, label: str = "") -> str:
+    return f"{TIMER_MARKER}{duration_text}" + (f" | {label}" if label else "")
+
+
+def is_timer_message(message: str) -> bool:
+    return (message or "").startswith(TIMER_MARKER)
+
+
+def reminder_speech(message: str) -> str:
+    """What to SAY when a reminder or timer fires. 'submit Alpha' -> 'Reminder to submit Alpha, sir.'"""
+    message = (message or "").strip()
+    if is_timer_message(message):
+        body = message[len(TIMER_MARKER):]
+        duration, _, label = (p.strip() for p in body.partition("|"))
+        if label:
+            return f"Your {duration} timer for {label} is up, sir."
+        return f"Your {duration} timer is up, sir."
+    if not message or message.lower() in ("this", "it"):
+        return "Reminder, sir."
+    body = message[0].lower() + message[1:] if message[:2].upper() != message[:2] else message
+    if body.lower().startswith("to "):
+        body = body[3:]
+    return f"Reminder to {body.rstrip('.!?')}, sir."
+
+
+def display_message(message: str) -> str:
+    """Human-readable form of a stored message (hides the timer marker)."""
+    if is_timer_message(message):
+        duration, _, label = (p.strip() for p in message[len(TIMER_MARKER):].partition("|"))
+        return f"{duration} timer" + (f" ({label})" if label else "")
+    return message
+
+
+# ---- Finding reminders by what the person says ------------------------------------------
+# "cancel it", "cancel wake up", "cancel the 30 minute reminder", "cancel 0decde46", "cancel the 5pm one".
+_ID_RE = re.compile(r"\b[0-9a-f]{8}\b")
+_KIND_WORDS = {"reminder", "reminders", "timer", "timers", "alarm", "alarms", "the", "my", "a", "an", "that", "this",
+               "one", "ones", "those", "these", "of", "for", "to", "and", "please", "ember", "sir", "active", "all",
+               "pending", "upcoming", "current", "me", "it"}
+PRONOUNS = {"it", "that", "this", "that one", "this one", "the last one", "last one", "the latest", "the latest one",
+            "the last", "that reminder", "this reminder", "that timer", "this timer", "it please"}
+
+
+def reminder_label(r) -> str:
+    return display_message(r.message)
+
+
+def describe_reminder(r) -> str:
+    when = r.fire_at.strftime("%I:%M %p").lstrip("0") + (r.fire_at.strftime(", %b %d") if r.fire_at.date() != datetime.now().date() else "")
+    return f"{reminder_label(r)} at {when} [{r.id}]" + (f" (repeats {r.recurrence})" if r.recurrence else "")
+
+
+def _words(text: str) -> "list[str]":
+    return [w for w in re.findall(r"[a-z0-9']+", (text or "").lower()) if w not in _KIND_WORDS]
+
+
+def find_reminders(reminders: list, query: str) -> list:
+    """Active reminders that the phrase `query` plausibly refers to. Tries, in order, an exact ID, a clock time
+    ("5pm"), a duration ("the 30 minute reminder" = one set for 30 minutes), then the reminder's own words. The
+    first signal that finds anything wins, so "cancel 0decde46" never also grabs a reminder whose text happens
+    to contain a similar word."""
+    q = (query or "").lower().strip()
+    if not q:
+        return []
+    ids = _ID_RE.findall(q)
+    if ids:
+        return [r for r in reminders if r.id in ids]
+
+    tm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b|\b(\d{1,2}):(\d{2})\b", q)
+    if tm and not re.search(r"\b(?:minute|min|hour|hr|second|sec)s?\b", q):
+        if tm.group(1):
+            h, m, mer = int(tm.group(1)), int(tm.group(2) or 0), tm.group(3)
+            h = (h % 12) + (12 if mer == "pm" else 0)
+        else:
+            h, m = int(tm.group(4)), int(tm.group(5))
+        hit = [r for r in reminders if r.fire_at.hour == h and r.fire_at.minute == m]
+        if hit:
+            return hit
+
+    dur = None
+    dm = re.search(rf"{_DUR_ONE}(?:\s*(?:,|and|&)?\s*{_DUR_ONE})*", q)
+    if dm:
+        dur = parse_duration_seconds(dm.group(0))
+    if dur:
+        hit = [r for r in reminders if abs((r.fire_at - r.created_at).total_seconds() - dur) <= 90
+               or (is_timer_message(r.message) and parse_duration_seconds(r.message) == dur)]
+        if hit:
+            return hit
+
+    words = _words(q)
+    if not words and not dm:
+        # only the KIND was named ("stop the timer", "cancel reminder"): every item of that kind
+        if re.search(r"\btimers?\b", q):
+            return [r for r in reminders if is_timer_message(r.message)]
+        if re.search(r"\b(?:reminders?|alarms?)\b", q):
+            return list(reminders)
+    words = [w for w in words if not re.fullmatch(r"\d+|minutes?|mins?|hours?|hrs?|seconds?|secs?", w)] or ([] if dur else words)
+    if not words:
+        return []
+    kind_timer = bool(re.search(r"\btimers?\b", q))
+    out = []
+    for r in reminders:
+        hay = f"{r.message} {reminder_label(r)}".lower()
+        if kind_timer and not is_timer_message(r.message):
+            continue
+        hay_words = set(re.findall(r"[a-z0-9']+", hay))
+        # every word the person used must be in the reminder (so "check stream" finds "check the stream")
+        if all(w in hay_words or any(h.startswith(w) and len(w) >= 4 for h in hay_words) for w in words):
+            out.append(r)
+    return out
+
+
+def all_identical(rs: list) -> bool:
+    """True when several reminders are the same thing set more than once (same text, same minute)."""
+    if len(rs) < 2:
+        return False
+    first = rs[0]
+    return all(r.message.strip().lower() == first.message.strip().lower()
+               and abs((r.fire_at - first.fire_at).total_seconds()) < 90 and r.recurrence == first.recurrence for r in rs[1:])

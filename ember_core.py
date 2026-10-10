@@ -32,7 +32,8 @@ from ember_tools import drive as drive_tool
 from ember_tools import file_ops
 from ember_reminders import (
     ReminderStore, parse_natural_time, TIME_PHRASE_RE,
-    parse_recurrence, RECURRENCE_PHRASE_RE,
+    parse_recurrence, RECURRENCE_PHRASE_RE, make_timer_message, display_message,
+    find_reminders, describe_reminder, all_identical, is_timer_message, PRONOUNS,
 )
 from ember_files import FileRegistry
 from ember_history import ConversationHistory
@@ -172,7 +173,27 @@ distinct pieces of information), give the full, structured answer
 immediately. Don't make the user ask twice for something they already
 asked for the first time. Never remind the user that you are an AI or
 apologize for being one. Do not use exclamation marks unless something is
-genuinely surprising."""
+genuinely surprising.
+
+GROUNDING — these outrank the style rules above:
+- Never state a personal fact about the user (where they live, their name,
+  birthday, plans, possessions) unless it appears in the "things you know about
+  the user" section below or the user said it in this conversation. If you do
+  not have it, say so in one short line. Never guess, and never invent a source
+  such as a "contact card", "profile" or "your calendar" that you were not given.
+- Never claim to have done something (saved, sent, moved, set, checked) unless a
+  tool result in this conversation says so.
+- For anything identified from an image or a short description (a car model or
+  generation, a plant species, a part number), say what is actually visible,
+  give your best identification with an honest confidence, and name the feature
+  that would settle it. Do not announce a specific year, series or variant as
+  fact unless a badge, text or unmistakable feature shows it. "Probably X; the
+  single round headlamp points away from Y" beats a confident wrong answer.
+- When the user disputes or corrects you, re-examine the evidence you have. If
+  their point is plausible, say what supports it and what would settle it, and
+  change your answer if the evidence allows. Hold your ground only by citing
+  something specific; never dismiss them with a quip instead of an answer.
+- Wit is fine, but it never replaces an answer and never substitutes for checking."""
 
 
 # Appended to the system prompt for turns whose reply will be READ ALOUD (a voice-originated turn, or
@@ -190,7 +211,7 @@ SPOKEN_ADDENDUM = (
 )
 
 
-def build_system_prompt(memory_context: str = "") -> str:
+def build_system_prompt(memory_context: str = "", memory_checked: bool = False) -> str:
     """Assemble the system prompt fresh each turn so the date/time is current.
     memory_context, if present, is recalled facts relevant to this turn —
     injected as context, not as instructions the model should follow."""
@@ -205,6 +226,12 @@ def build_system_prompt(memory_context: str = "") -> str:
         prompt += (
             "\n\nRelevant things you know about the user from past conversations "
             f"(use naturally, don't recite this list):\n{memory_context}"
+        )
+    elif memory_checked:
+        prompt += (
+            "\n\nMemory was searched for this message and nothing relevant was stored. If the user is "
+            "asking for a personal fact about themselves, tell them you don't have it on record and "
+            "offer to remember it; do not guess."
         )
     return prompt
 
@@ -234,6 +261,11 @@ _SEARCH_TRIGGER_PATTERNS = [
     # because "next" itself was recognized. "what teams are racing next
     # season" and "next weekend the WEC races" both got zero hits.
     r"\bnext\s+(?:week|weekend|season|year|round|race)\b",
+    # "this evening"/"tomorrow" were missing (only "tonight"/"today" counted), so "what time is the race this
+    # evening?" went to plain chat and got "I do not have access to your schedule". And a "what time is
+    # <event>" question is about the outside world unless it says "my".
+    r"\bthis\s+(?:morning|afternoon|evening)\b", r"\btomorrow\b",
+    r"^(?!.*\bmy\b)\s*(?:what|when)(?:'?s|\s+is|\s+time\s+is|\s+time\s+does|\s+time\s+will|\s+time)\b.*\b(?:race|qualifying|practice|grand\s+prix|gp|match|game|fixture|kick-?off|concert|keynote|premiere|livestream|stream|final)\b",
     r"\bcurrent(ly)?\b", r"\blatest\b", r"\brecent(ly)?\b", r"\bnow\b",
     r"\bnews\b", r"\bweather\b", r"\bscore\b", r"\bstock\b", r"\bprice\b",
     r"\bwho is\b", r"\bwho'?s\b", r"\bwhen is\b", r"\bwhen'?s\b",
@@ -531,6 +563,20 @@ _EXPLICIT_SEARCH_RE = re.compile(
 )
 
 
+_SEARCH_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:hey\s+)?ember[,!.]?\s*)?(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?"
+    r"(?:search(?:\s+(?:the\s+)?(?:web|internet|online))?(?:\s+for)?|google|look\s*up|find\s+out|find)\s+",
+    re.IGNORECASE,
+)
+
+
+def clean_search_query(message: str) -> str:
+    """The text that goes to the search engine. "search for what time is the race" must not search for the
+    word "search" -- that is how a race question came back with Microsoft Search API documentation."""
+    q = _SEARCH_PREFIX_RE.sub("", message or "").strip().rstrip("?.! ")
+    return q or (message or "").strip()
+
+
 def _is_explicit_search_request(message: str) -> bool:
     return bool(_EXPLICIT_SEARCH_RE.search(message))
 
@@ -751,8 +797,35 @@ _CALENDAR_RESCHEDULE_PRONOUN_RE = re.compile(r"^\s*(?:please\s+)?reschedule\s+(?
 _REMINDER_CANCEL_RE = re.compile(r"\bcancel\s+reminder\s+(\S+)", re.IGNORECASE)
 _REMINDER_CREATE_RE = re.compile(r"\bremind me\s+(?:to\s+)?(.+)", re.IGNORECASE)
 _REMINDER_LIST_RE = re.compile(
-    r"\b(?:what are|show|list)\s+(?:my|our)\s+(?:reminders?|tasks?|to-?dos?)\b"
+    # "show active reminders", "active reminders", "reminders", "list my timers", "what reminders do i have",
+    # "do i have any reminders", "how many timers", "when is my wake up reminder" -- all of these used to fall
+    # through to the model, which then invented a list (or "I do not have access to any reminders").
+    r"^\s*(?:so[,\s]+|ok(?:ay)?[,\s]+|please\s+|ember[,\s]+|hey ember[,\s]+|can you\s+|could you\s+)*"
+    r"(?:(?:what|which)\s+(?:are\s+)?(?:my\s+|our\s+|the\s+)?(?:active\s+|pending\s+|upcoming\s+|current\s+)*(?:reminders?|timers?|alarms?)(?:\s+do\s+i\s+have|\s+are\s+(?:set|active|pending))?"
+    r"|(?:show|list|see|view|display|check|get|give\s+me|tell\s+me)\s+(?:me\s+)?(?:all\s+)?(?:of\s+)?(?:my\s+|our\s+|the\s+)?(?:all\s+)?(?:active\s+|pending\s+|upcoming\s+|current\s+|all\s+)*(?:reminders?|timers?|alarms?|tasks?|to-?dos?)"
+    r"|(?:do\s+i\s+have|have\s+i\s+got|is\s+there)\s+(?:any|a)\s+(?:active\s+|pending\s+|upcoming\s+)*(?:reminders?|timers?|alarms?)"
+    r"|how\s+many\s+(?:active\s+)?(?:reminders?|timers?|alarms?)"
+    r"|(?:my\s+|our\s+|the\s+)?(?:all\s+)?(?:active\s+|pending\s+|upcoming\s+|current\s+)*(?:reminders?|timers?|alarms?|tasks?|to-?dos?)"
+    r"|when\s+(?:is|does|will)\s+(?:my|the)\s+.{0,40}?(?:reminder|timer|alarm)(?:\s+(?:go\s+off|ring|fire))?)"
+    r"(?:\s+(?:for\s+)?(?:today|tonight|now|please|sir))*\s*[?.!]*\s*$"
+    r"|\b(?:what are|show|list)\s+(?:my|our)\s+(?:reminders?|tasks?|to-?dos?)\b"
     r"|\b(?:my|our)\s+(?:reminders?|tasks?|to-?dos?)\s+(?:for\s+)?(?:today|tonight)?\??$",
+    re.IGNORECASE,
+)
+
+_REM_LEAD = r"^\s*(?:so[,\s]+|ok(?:ay)?[,\s]+|please\s+|ember[,\s]+|hey ember[,\s]+|can you\s+|could you\s+|will you\s+)*"
+_REM_VERB = r"(?:cancel|delete|remove|clear|stop|dismiss|turn\s+off|get\s+rid\s+of|kill|drop|wipe)"
+_REM_NOUN = r"(?:reminders?|timers?|alarms?)"
+_REM_NOUN_PL = r"(?:reminders|timers|alarms)"
+_REMINDER_CANCEL_ALL_RE = re.compile(
+    _REM_LEAD + _REM_VERB + r"\s+(?:all\s+(?:of\s+)?)?(?:(?:my|the|our|these|those)\s+)?(?:(?:all|active|pending|upcoming|current)\s+)*(" + _REM_NOUN_PL + r")(?:\s+(?:please|sir|now))?\s*[.!]*\s*$"
+    r"|" + _REM_LEAD + _REM_VERB + r"\s+(?:all|every(?:thing)?)\s+(?:of\s+)?(?:them|it)?\s*(" + _REM_NOUN + r")?\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+_REMINDER_CANCEL_RE = re.compile(_REM_LEAD + _REM_VERB + r"\s+(?P<q>.+?)\s*[.!?]*\s*$", re.IGNORECASE)
+_CALENDAR_WORD_RE = re.compile(r"\b(?:meeting|appointment|event|sync|call|review|calendar)\b", re.IGNORECASE)
+_REMINDER_CHOICE_RE = re.compile(
+    r"^\s*(?:ember[,\s]+)?(?:the\s+|number\s+|no\.?\s*|#)?(?P<c>all(?:\s+of\s+them)?|both|every\s+one|everything|first|second|third|fourth|last|\d{1,2}|[0-9a-f]{8})(?:\s+(?:one|ones))?\s*[.!]*\s*$",
     re.IGNORECASE,
 )
 
@@ -796,6 +869,16 @@ _TRAILING_ADDRESS_RE = re.compile(r"[,\s]*\bember\b[.,!?]*\s*$", re.IGNORECASE)
 
 def _strip_trailing_address(text: "str | None") -> str:
     return _TRAILING_ADDRESS_RE.sub("", text or "").strip()
+
+
+def _clean_reminder_text(text: str) -> str:
+    """Tidy what is left of a reminder request once the time phrase is cut out. The old code did
+    .strip(" ,.to"), which strips the LETTERS t and o from both ends, so "take out the trash" was stored as
+    "ake out the trash" and "go" as "g"."""
+    t = re.sub(r"\s+", " ", text or "").strip(" ,.;:-")
+    t = re.sub(r"^(?:to|that i|i should|i need to)\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+(?:to|and|then)$", "", t, flags=re.IGNORECASE)
+    return t.strip(" ,.;:-")
 
 
 def _register_builtin_tools() -> None:
@@ -851,12 +934,128 @@ def _register_builtin_tools() -> None:
     registry.register("teach_speech_correction", "Teaches the speech recogniser a mishearing", _TEACH_HEARD_RE, _teach_heard)
     registry.register("teach_speech_term", "Adds a word to the speech vocabulary", _TEACH_TERM_RE, _teach_term)
 
-    def _cancel_reminder(match):
-        reminder_id = match.group(1)
-        ok = _reminder_store.cancel(reminder_id)
-        return f"Cancelled reminder {reminder_id}, sir." if ok else f"No active reminder with ID {reminder_id}, sir."
+    # ---- Reminder/timer management --------------------------------------------------------------------
+    # Everything below used to need the exact phrase "cancel reminder <id>"; anything else ("cancel wake up",
+    # "cancel it", "all of them", "delete active reminders") fell through to the MODEL, which cheerfully
+    # replied "Done, sir, cancelled" while nothing was cancelled at all. These tools do the work, and answer
+    # honestly when they can't.
+    def _remember_reminder(r=None, subject="reminder"):
+        _dispatch_context["last_subject"] = subject
+        if r is not None:
+            _dispatch_context["last_reminder_id"] = r.id
 
-    registry.register("cancel_reminder", "Cancels a reminder by ID", _REMINDER_CANCEL_RE.pattern, _cancel_reminder)
+    def _list_for_choice(rs):
+        return "; ".join(f"{i}) {describe_reminder(r)}" for i, r in enumerate(rs, 1))
+
+    def _cancel_these(rs, note=""):
+        done = [r for r in rs if _reminder_store.cancel(r.id)]
+        _dispatch_context.pop("pending_reminder_choice", None)
+        if not done:
+            return "Those were already gone, sir — nothing left to cancel."
+        if len(done) == 1:
+            return f"Cancelled '{display_message(done[0].message)}', sir.{note}"
+        return f"Cancelled {len(done)} reminders, sir.{note}"
+
+    def _active_count():
+        return len(_reminder_store.list_active())
+
+    def _cancel_all_guard(m):
+        if _active_count() == 0:
+            return False
+        scope = ((m.group(1) or m.group(2) or "") if m.lastindex else "").lower()
+        return True
+
+    def _cancel_all(match):
+        scope = ((match.group(1) or match.group(2) or "")).lower()
+        active = _reminder_store.list_active()
+        if scope.startswith("timer"):
+            active = [r for r in active if is_timer_message(r.message)]
+        n = len([r for r in active if _reminder_store.cancel(r.id)])
+        _dispatch_context.pop("pending_reminder_choice", None)
+        kind = "timers" if scope.startswith("timer") else "reminders"
+        return (f"Cancelled all {n} {kind[:-1] if n == 1 else kind}, sir." if n != 1 else f"Cancelled the one active {kind[:-1]}, sir.") if n else f"You've no active {kind}, sir."
+
+    registry.register("cancel_all_reminders", "Cancels every active reminder or timer — confirmed first", _REMINDER_CANCEL_ALL_RE.pattern, _cancel_all, destructive=True, guard=_cancel_all_guard)
+
+    def _cancel_query(m):
+        return (m.group("q") or "").strip()
+
+    def _cancel_guard(m):
+        q = _cancel_query(m).lower()
+        if not q:
+            return False
+        q_core = re.sub(r"^(?:(?:the|my|that|this|those|these|our)\s+)+", "", q).strip()
+        has_noun = bool(re.search(r"\b" + _REM_NOUN + r"\b", q))
+        if _CALENDAR_WORD_RE.search(q) and not has_noun:
+            return False
+        if has_noun:
+            return True
+        if re.search(r"\b[0-9a-f]{8}\b", q):
+            return bool(find_reminders(_reminder_store.list_active(), q))
+        if q_core in PRONOUNS or q in PRONOUNS:
+            # a pronoun is only about a reminder when one is plausibly "it": the one just made/listed, or the only one
+            if _dispatch_context.get("last_subject") == "calendar" and _dispatch_context.get("last_calendar_event"):
+                return False
+            return _active_count() > 0
+        return bool(find_reminders(_reminder_store.list_active(), q))   # "cancel wake up" when a reminder says that
+
+    def _cancel_reminder(match):
+        q = _cancel_query(match).lower()
+        q = re.sub(r"\b(?:please|sir|now)\b", "", q).strip(" ,.")
+        q_core = re.sub(r"^(?:(?:the|my|that|this|those|these|our)\s+)+", "", q).strip()
+        active = _reminder_store.list_active()
+        if not active:
+            return "You've no active reminders or timers to cancel, sir."
+
+        if q in PRONOUNS or q_core in PRONOUNS:
+            last = next((r for r in active if r.id == _dispatch_context.get("last_reminder_id")), None)
+            hits = [last] if last else (active if len(active) == 1 else [])
+            if not hits:
+                _dispatch_context["pending_reminder_choice"] = ([r.id for r in active], __import__("time").time())
+                return f"Which one, sir? {_list_for_choice(active)}"
+        else:
+            hits = find_reminders(active, q)
+
+        if not hits:
+            return (f"I couldn't find an active reminder or timer matching '{q}', sir — nothing was cancelled. "
+                    f"Active: {_list_for_choice(active)}")
+        if len(hits) > 1:
+            if all_identical(hits):
+                return _cancel_these(hits, note=f" (they were {len(hits)} copies of the same one)")
+            _dispatch_context["pending_reminder_choice"] = ([r.id for r in hits], __import__("time").time())
+            return (f"{len(hits)} match, sir: {_list_for_choice(hits)}. Say a number, 'all of them', or the ID.")
+        return _cancel_these(hits)
+
+    registry.register("cancel_reminder", "Cancels a reminder or timer by ID, wording, duration, time, or 'it'", _REMINDER_CANCEL_RE.pattern, _cancel_reminder, guard=_cancel_guard)
+
+    def _choice_pending():
+        pend = _dispatch_context.get("pending_reminder_choice")
+        return bool(pend) and (__import__("time").time() - pend[1]) < 300
+
+    def _choice_guard(m):
+        return _choice_pending()
+
+    def _resolve_choice(match):
+        ids, _ts = _dispatch_context["pending_reminder_choice"]
+        live = [r for r in _reminder_store.list_active() if r.id in ids]
+        order = {rid: i for i, rid in enumerate(ids)}
+        live.sort(key=lambda r: order.get(r.id, 99))
+        c = match.group("c").lower().strip()
+        if not live:
+            _dispatch_context.pop("pending_reminder_choice", None)
+            return "Those are already gone, sir."
+        if re.fullmatch(r"all(?:\s+of\s+them)?|both|every\s+one|everything", c):
+            return _cancel_these(live)
+        word_to_idx = {"first": 0, "second": 1, "third": 2, "fourth": 3, "last": len(live) - 1}
+        if re.fullmatch(r"[0-9a-f]{8}", c) and not c.isdigit():
+            hit = [r for r in live if r.id == c]
+            return _cancel_these(hit) if hit else f"No reminder with ID {c} in that list, sir."
+        idx = word_to_idx[c] if c in word_to_idx else (int(c) - 1 if c.isdigit() else None)
+        if idx is None or not (0 <= idx < len(live)):
+            return f"I didn't get that, sir — pick 1 to {len(live)}, 'all of them', or an ID."
+        return _cancel_these([live[idx]])
+
+    registry.register("resolve_reminder_choice", "Answers 'which one?' after an ambiguous reminder cancel", _REMINDER_CHOICE_RE.pattern, _resolve_choice, guard=_choice_guard)
 
     def _create_reminder(match):
         arg = _strip_trailing_address(match.group(1).strip())
@@ -878,7 +1077,7 @@ def _register_builtin_tools() -> None:
                 fire_at = datetime.now().replace(hour=9, minute=0, second=0, microsecond=0)
                 if fire_at <= datetime.now():
                     fire_at += timedelta(days=1)
-                reminder_text = arg_without_recurrence.strip(" ,.to") or "this"
+                reminder_text = _clean_reminder_text(arg_without_recurrence) or "this"
             else:
                 return (
                     "I didn't catch when to remind you, sir — try 'remind me to <thing> "
@@ -886,26 +1085,64 @@ def _register_builtin_tools() -> None:
                 )
         else:
             time_phrase = time_match.group(0)
-            reminder_text = (arg_without_recurrence[: time_match.start()] + arg_without_recurrence[time_match.end():]).strip(" ,.to")
+            reminder_text = _clean_reminder_text(arg_without_recurrence[: time_match.start()] + " " + arg_without_recurrence[time_match.end():])
             if not reminder_text:
                 reminder_text = "this"
             fire_at, error = parse_natural_time(time_phrase)
             if fire_at is None:
                 return error
 
+        for existing in _reminder_store.list_active():
+            if (existing.message.strip().lower() == reminder_text.strip().lower() and existing.recurrence == recurrence
+                    and abs((existing.fire_at - fire_at).total_seconds()) < 90):
+                _remember_reminder(existing)
+                return f"You already have that one set, sir — '{reminder_text}' at {existing.fire_at.strftime('%I:%M %p on %b %d')}. (ID: {existing.id})"
         reminder = _reminder_store.add(reminder_text, fire_at, recurrence=recurrence)
+        _remember_reminder(reminder)
         when = fire_at.strftime("%I:%M %p on %b %d")
         recur_note = f" (repeats {recurrence})" if recurrence else ""
         return f"Reminder set, sir — I'll remind you to {reminder_text} at {when}{recur_note}. (ID: {reminder.id})"
 
     registry.register("create_reminder", "Creates a one-shot or recurring reminder", _REMINDER_CREATE_RE.pattern, _create_reminder)
 
+    # ---- Timers ("set a timer for 10 minutes", "start a 5 minute timer for the pasta") ----------------
+    # Stored as a reminder (see ember_reminders.make_timer_message), so it fires through the same bus
+    # event, the desktop client speaks it, and it survives a restart.
+    _TIMER_UNITS = {"second": 1, "sec": 1, "minute": 60, "min": 60, "hour": 3600, "hr": 3600}
+    _TIMER_RE = (
+        r"\b(?:set|start|begin|create|put\s+on)\s+(?:me\s+)?(?:a|an|the)?\s*(?:(\d+|an?|one|half\s+an?)\s*[- ]?(second|sec|minute|min|hour|hr)s?[- ]?)\s*timer\b(?:\s+(?:for|called|to)\s+(.+))?"
+        r"|\b(?:set|start|begin|create)\s+(?:me\s+)?(?:a|an|the)?\s*timer\s+(?:for|of)\s+(\d+|an?|one|half\s+an?)\s*(second|sec|minute|min|hour|hr)s?\b(?:\s+(?:for|called|to)\s+(.+))?"
+    )
+
+    def _set_timer(match):
+        g = match.groups()
+        amount, unit, label = (g[0], g[1], g[2]) if g[0] else (g[3], g[4], g[5])
+        word = (amount or "").lower().strip()
+        count = 0.5 if word.startswith("half") else (1 if word in ("a", "an", "one") else int(word))
+        seconds = int(count * _TIMER_UNITS[unit.lower()])
+        if seconds < 1 or seconds > 24 * 3600:
+            return "A timer has to be between a second and 24 hours, sir."
+        label = _strip_trailing_address((label or "").strip().strip(".!?"))
+        if seconds % 3600 == 0:
+            n = seconds // 3600; duration = f"{n} hour"
+        elif seconds % 60 == 0:
+            n = seconds // 60; duration = f"{n} minute"
+        else:
+            n = seconds; duration = f"{n} second"
+        fire_at = datetime.now() + timedelta(seconds=seconds)
+        reminder = _reminder_store.add(make_timer_message(duration, label), fire_at)
+        _remember_reminder(reminder)
+        return f"Timer set, sir — {duration}{' for ' + label if label else ''}, rings at {fire_at.strftime('%I:%M:%S %p').lstrip('0')}. (ID: {reminder.id})"
+
+    registry.register("set_timer", "Starts a countdown timer that announces itself by voice", _TIMER_RE, _set_timer)
+
     def _list_reminders(match):
         reminders = _reminder_store.list_active()
         if not reminders:
             return "You've got no active reminders, sir."
+        _remember_reminder(reminders[0] if len(reminders) == 1 else None)
         lines = [
-            f"  [{r.id}] {r.message} — {r.fire_at.strftime('%I:%M %p on %b %d')}"
+            f"  [{r.id}] {display_message(r.message)} — {r.fire_at.strftime('%I:%M %p on %b %d')}"
             + (f" (repeats {r.recurrence})" if r.recurrence else "")
             for r in reminders
         ]
@@ -1146,6 +1383,7 @@ def _register_builtin_tools() -> None:
         # fabricated an entire fake cancel exchange instead. Ambiguous
         # (0 or 2+ events) intentionally leaves this cleared — guessing
         # which one "that" means would be worse than asking again.
+        _dispatch_context["last_subject"] = "calendar"
         _dispatch_context["last_calendar_event"] = (
             {"event_id": events[0]["id"], "summary": events[0]["summary"]} if len(events) == 1 else None
         )
@@ -1166,6 +1404,7 @@ def _register_builtin_tools() -> None:
         # ("4pm, ember.") can actually change the real event instead of
         # falling through to chat and getting a fabricated "corrected"
         # reply — see _correct_calendar_event below.
+        _dispatch_context["last_subject"] = "calendar"
         _dispatch_context["last_calendar_event"] = {"event_id": event_id, "summary": summary} if event_id else None
         return message
 
@@ -1200,6 +1439,9 @@ def _register_builtin_tools() -> None:
         _CALENDAR_CANCEL_PRONOUN_RE.pattern,
         _cancel_calendar_event_pronoun,
         destructive=True,
+        # Only when there IS a calendar event in play, and it is more recent than any reminder. Otherwise
+        # "cancel it" right after a reminder list answered "I don't have a specific event in mind".
+        guard=lambda m: bool(_dispatch_context.get("last_calendar_event")) and _dispatch_context.get("last_subject") != "reminder",
     )
 
     def _reschedule_calendar_event_pronoun(match):
@@ -1214,6 +1456,7 @@ def _register_builtin_tools() -> None:
         "Reschedules the calendar event just shown/created, referenced by pronoun",
         _CALENDAR_RESCHEDULE_PRONOUN_RE.pattern,
         _reschedule_calendar_event_pronoun,
+        guard=lambda m: bool(_dispatch_context.get("last_calendar_event")) and _dispatch_context.get("last_subject") != "reminder",
     )
 
     def _cancel_calendar_event(match):
@@ -1370,6 +1613,32 @@ def _register_builtin_queries() -> None:
 _register_builtin_queries()
 
 
+_UNROUTED_REMINDER_ACTION_RE = re.compile(
+    _REM_LEAD + r"(?P<verb>cancel|delete|remove|clear|stop|dismiss|snooze|edit|change|update|reschedule|postpone|move|set|add|create|make|disable|turn\s+off|turn\s+on|enable)\b.*\b" + _REM_NOUN + r"\b",
+    re.IGNORECASE,
+)
+
+
+def _unrouted_reminder_reply(message: str) -> "str | None":
+    """Safety net. A reminder/timer/alarm COMMAND that no tool claimed used to go to the language model, which
+    would reply "Done, sir, cancelled" without doing anything. Say plainly that nothing happened instead."""
+    m = _UNROUTED_REMINDER_ACTION_RE.match(message or "")
+    if not m or "?" in (message or "").rstrip()[-1:]:
+        return None
+    verb = m.group("verb").lower()
+    if verb in ("set", "add", "create", "make", "turn on", "enable"):
+        if re.search(r"\balarms?\b", message, re.IGNORECASE):
+            return ("I don't do alarms as such, sir, and nothing was set. Say 'remind me at 7am to wake up' "
+                    "or 'set a timer for 10 minutes'.")
+        return ("I didn't catch the time, sir, so nothing was set. Try 'remind me in 2 hours to call home' "
+                "or 'set a timer for 10 minutes'.")
+    if verb in ("edit", "change", "update", "reschedule", "postpone", "move", "snooze"):
+        return ("I can't edit a reminder in place yet, sir, and nothing was changed. Cancel it ('cancel the wake up "
+                "reminder') and set it again.")
+    return ("I couldn't match that to a reminder or timer, sir, so nothing was cancelled. Say 'show reminders', then "
+            "'cancel' plus a few of its words, its time, or its ID.")
+
+
 def _classify_action(message: str) -> "tuple | None":
     """Returns (tool, match) if `message` matches something the registry
     knows how to execute, else None. Thin wrapper kept for classify_intent
@@ -1395,23 +1664,17 @@ def _dispatch_action(action_payload: "tuple", last_assistant_reply: "str | None"
 
 
 def _fuzzy_cancel_reminder(target: str) -> "str | None":
-    """Backs STOP_TASK: tries to match `target` against active reminders'
-    text. Returns a reply string if exactly one reminder matched and was
-    cancelled, a clarification if more than one plausibly matched, or
-    None if nothing matched at all — the None case is deliberate (see
-    ember_intent.py's docstring on _check_interrupt): a stop-word aimed at
-    something Ember isn't actually tracking should fall through to
-    ordinary chat, not produce an unprompted "I couldn't find that.\""""
-    target_lower = target.lower()
-    candidates = [r for r in _reminder_store.list_active() if target_lower in r.message.lower()]
-    if not candidates:
+    """Backs STOP_TASK ("stop the AQI system"): cancel a reminder/timer the target clearly names, else None so the
+    message falls through to ordinary chat. Uses the same matcher as the "cancel ..." tool."""
+    active = _reminder_store.list_active()
+    hits = find_reminders(active, target)
+    if not hits:
         return None
-    if len(candidates) > 1:
-        options = "; ".join(f"[{r.id}] {r.message}" for r in candidates)
+    if len(hits) > 1 and not all_identical(hits):
+        options = "; ".join(describe_reminder(r) for r in hits)
         return f"A few reminders match '{target}', sir — which one? {options}"
-    reminder = candidates[0]
-    _reminder_store.cancel(reminder.id)
-    return f"Stopped '{reminder.message}', sir."
+    cancelled = [r for r in hits if _reminder_store.cancel(r.id)]
+    return f"Stopped '{display_message(hits[0].message)}', sir." + (f" ({len(cancelled)} copies.)" if len(cancelled) > 1 else "")
 
 
 def _dispatch_command(result: "ember_intent.IntentResult", conversation: "EmberConversation | None" = None) -> "str | None":
@@ -1773,6 +2036,12 @@ _RECALL_TRIGGER_PATTERNS = [
     r"\bmy\b", r"\bmine\b", r"\bdo you know\b", r"\bremember\b", r"\brecall\b",
     r"\bwe (talked|discussed)\b", r"\bearlier\b", r"\bbefore\b", r"\blast time\b",
     r"\bpreviously\b", r"\bagain\b", r"\bam i\b", r"\bwhat do i\b", r"\bwhat am i\b",
+    # First-person questions with no "my" in them ("where do i reside?", "who am i", "did i tell you
+    # my...", "when was i born") used to skip recall entirely, so the model answered from nothing --
+    # and invented a city and a "contact card" to go with it.
+    r"\b(?:do|did|have|has|was|will|would|should|can|could|am)\s+i\b",
+    r"\bwho\s+am\s+i\b", r"\bwhere\s+(?:do|did|am|was)\s+i\b", r"\bwhat\s+(?:did|have)\s+i\b",
+    r"\bhow\s+(?:old|tall|long|many|much)\b.*\bi\b", r"\bwhat\s+am\s+i\b",
 ]
 _RECALL_TRIGGER_RE = re.compile("|".join(_RECALL_TRIGGER_PATTERNS), re.IGNORECASE)
 
@@ -1899,16 +2168,31 @@ def _build_runtime() -> EmberRuntime:
 
 
 def _vision_for_attachments(image_bytes: bytes, mime_type: str, query: str) -> str:
-    """Same Gemini vision call the analyze_document tool uses, at module
-    level so the attachment path (ember_attachments.py) can reach it."""
-    response = llm_client._gemini_client.models.generate_content(
-        model="gemini-3.5-flash-lite",
-        contents=[{"parts": [
-            {"text": query},
-            {"inline_data": {"mime_type": mime_type, "data": image_bytes}},
-        ]}],
-    )
-    return response.text or ""
+    """Gemini vision for chat attachments. Tries the stronger model first while its daily quota
+    lasts (fine-grained identification -- a car's generation, a part, small text -- is exactly where
+    the lite model guesses), then the lite one. Quota is tracked the same way generate() tracks it."""
+    last_error = None
+    for tier in llm_client.CLOUD_TIERS:
+        model = tier["model"]
+        if not llm_client._quota.can_use(model):
+            continue
+        try:
+            response = llm_client._gemini_client.models.generate_content(
+                model=model,
+                contents=[{"parts": [
+                    {"text": query},
+                    {"inline_data": {"mime_type": mime_type, "data": image_bytes}},
+                ]}],
+            )
+            llm_client._quota.record(model)
+            if response.text:
+                return response.text
+        except Exception as e:
+            last_error = e
+            continue
+    if last_error:
+        raise last_error
+    return ""
 
 
 def _on_attachment_saved(att: dict) -> None:
@@ -2019,10 +2303,12 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
     research_s = 0.0
 
     recall_text = ""
+    recall_checked = False
     if needs_recall(user_input):
         recall = memory.recall(user_input, llm_client.embed, n=8)
         recall_text = recall.text
-    system_prompt = build_system_prompt(memory_context=recall_text)
+        recall_checked = True
+    system_prompt = build_system_prompt(memory_context=recall_text, memory_checked=recall_checked)
     if getattr(conversation, "spoken_reply", False):
         system_prompt += "\n\n" + SPOKEN_ADDENDUM
 
@@ -2036,6 +2322,13 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
     wants_search = intent == "search"
     verified_via_evidence = False
     search_evidence_used = False
+
+    if intent == "chat":
+        unrouted = _unrouted_reminder_reply(user_input)
+        if unrouted:
+            _append_history("user", user_input, conversation=conversation)
+            _append_history("assistant", unrouted, conversation=conversation)
+            return "unrouted", unrouted
 
     if intent == "action":
         last_reply = next(
@@ -2165,7 +2458,7 @@ def process_turn(user_input: str, conversation: "EmberConversation | None" = Non
         # Still at most 2 Tavily calls per turn, never an open-ended loop.
         _emit_stream_status(stream_callback, "Searching for that, sir — one moment...")
         _t_r = time.perf_counter()
-        research_result = ember_research.research(user_input, llm_client.web_search, cancel_check=conversation.is_cancelled)
+        research_result = ember_research.research(clean_search_query(user_input), llm_client.web_search, cancel_check=conversation.is_cancelled)
         research_s = time.perf_counter() - _t_r
         print(f"[ember_core] research: {len(research_result.evidence)} source(s), {research_result.rounds_used} round(s), {research_s:.1f}s")
         evidence = research_result.evidence

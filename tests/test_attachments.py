@@ -104,7 +104,8 @@ class BlockAndAugmentTests(unittest.TestCase):
         block = ea.build_block(saved, "what colour is it?", vision)
         self.assertIn("a red square", block)
         self.assertEqual(seen["mime"], "image/png")
-        self.assertEqual(seen["q"], "what colour is it?")
+        self.assertIn("what colour is it?", seen["q"])             # the question is passed along...
+        self.assertIn("visible", seen["q"])                         # ...with the evidence-first rules, not alone
 
     def test_image_without_vision_is_honest(self):
         saved = self._save("pic.jpg", b"fake")

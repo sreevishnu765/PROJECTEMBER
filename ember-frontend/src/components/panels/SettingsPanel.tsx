@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Check } from "lucide-react";
 import { PanelHost } from "./PanelHost";
+import { GuidePanel } from "./GuidePanel";
 
 const VOICES = ["Heart", "Isabella", "Daniel"] as const;
 type VoiceName = (typeof VOICES)[number];
@@ -12,6 +13,7 @@ interface SettingsPanelProps {
 }
 
 export function SettingsPanel({ onClose, onSelectVoice }: SettingsPanelProps) {
+  const [tab, setTab] = useState<"general" | "guide">("general");
   const [selectedVoice, setSelectedVoice] = useState<VoiceName>(
     () => (localStorage.getItem(VOICE_STORAGE_KEY) as VoiceName) || "Heart",
   );
@@ -24,6 +26,22 @@ export function SettingsPanel({ onClose, onSelectVoice }: SettingsPanelProps) {
 
   return (
     <PanelHost title="Settings" onClose={onClose}>
+      <div className="mb-4 flex gap-1 rounded-lg border border-border p-0.5">
+        {(["general", "guide"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`flex-1 rounded-md px-3 py-1.5 text-[12.5px] capitalize transition-colors ${
+              tab === t ? "bg-surfaceRaised text-textPrimary" : "text-textSecondary hover:text-textPrimary"
+            }`}
+          >
+            {t === "guide" ? "Guide" : "General"}
+          </button>
+        ))}
+      </div>
+      {tab === "guide" ? (
+        <GuidePanel />
+      ) : (
       <div className="space-y-4">
         <div>
           <h3 className="mb-2 text-[11.5px] font-medium uppercase tracking-wide text-textMuted">Voice</h3>
@@ -48,6 +66,7 @@ export function SettingsPanel({ onClose, onSelectVoice }: SettingsPanelProps) {
           </p>
         </div>
       </div>
+      )}
     </PanelHost>
   );
 }

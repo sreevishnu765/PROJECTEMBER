@@ -379,3 +379,31 @@ class ClientHeadlessTest(TransportCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReminderDeliveryTests(TransportCase):
+    """A reminder firing on the server must reach the connected client AND be spoken -- even though this
+    connection never turned voice on."""
+
+    async def test_due_reminder_is_sent_and_spoken(self):
+        from ember_bus import get_bus
+        from ember_reminders import make_timer_message
+        get_bus().publish("reminder.due", {"id": "r1", "message": "submit Alpha", "priority": "normal"})
+        get_bus().publish("reminder.due", {"id": "r2", "message": make_timer_message("10 minute"), "priority": "normal"})
+        got, audio = [], 0
+        deadline = time.time() + 6
+        while time.time() < deadline and (len(got) < 2 or audio == 0):
+            try:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if isinstance(raw, bytes):
+                continue
+            m = json.loads(raw)
+            if m["type"] == "reminder":
+                got.append(m)
+            elif m["type"] == "audio_chunk":
+                audio += 1
+        self.assertEqual([g["spoken"] for g in got], ["Reminder to submit Alpha, sir.", "Your 10 minute timer is up, sir."])
+        self.assertEqual(got[1]["message"], "10 minute timer")
+        self.assertGreater(audio, 0, "reminder was shown but never spoken")

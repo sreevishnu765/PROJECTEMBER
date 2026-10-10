@@ -127,6 +127,40 @@ export function useEmberChat() {
           });
           break;
         }
+        case "reminder": {
+          // A reminder or timer fired. The server speaks it; this puts it in the conversation (so it is
+          // still there if you missed the voice) and raises a desktop notification. It is NOT tied to
+          // the in-flight reply, so it can't be swallowed by, or clobber, a turn that is streaming.
+          const when = msg.late ? " (fired while Ember was offline)" : "";
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: makeId(),
+              role: "assistant",
+              content: `\u23F0 ${msg.spoken}${when}`,
+              statusLine: null,
+              tag: null,
+              providerFamily: null,
+              grounded: false,
+              error: null,
+              pending: false,
+            },
+          ]);
+          // The playback queue is normally created on the first mic/speaker click. A reminder can arrive
+          // before that ever happens; Electron runs with autoplay allowed, so create it now.
+          if (!playbackRef.current) playbackRef.current = new VoicePlaybackQueue();
+          playbackRef.current.resume();
+          try {
+            if ("Notification" in window) {
+              const show = () => new Notification("Ember", { body: msg.spoken, silent: true });
+              if (Notification.permission === "granted") show();
+              else if (Notification.permission !== "denied") void Notification.requestPermission().then((p) => p === "granted" && show());
+            }
+          } catch {
+            /* notifications are a bonus; the in-chat message and the voice are the real delivery */
+          }
+          break;
+        }
         case "confirmation_required":
           setPendingConfirmation({
             requestId: msg.request_id,
