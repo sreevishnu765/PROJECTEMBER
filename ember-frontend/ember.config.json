@@ -1,5 +1,5 @@
 {
-  "pythonPath": "D:\\VISHNU\\PROJECTEMBER\\venv\\Scripts\\python.exe",
-  "backendDir": "D:\\VISHNU\\PROJECTEMBER",
+  "pythonPath": "C:/Projects/PROJECTEMBER/venv/Scripts/python.exe",
+  "backendDir": "C:/Projects/PROJECTEMBER",
   "backendEntry": "run_transport.py"
 }

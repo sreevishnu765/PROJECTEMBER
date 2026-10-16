@@ -159,11 +159,46 @@ VISION_GROUND_RULES = (
 )
 
 
+# "convert it to text", "extract the text", "transcribe this", "what does it say", "read it out"...
+# The user wants the CONTENT back in the reply, not a description of the image and not an "ok, done".
+_TRANSCRIBE_RE = re.compile(
+    r"\b(?:(?:convert|turn|change|make|put|get|extract|pull|copy|write|type|read|scan|ocr|transcribe|"
+    r"digiti[sz]e)\b[^.?!\n]{0,40}?\b(?:text|words|writing|wording|content|typed|plain\s+text)|"
+    r"transcri(?:be|ption)|\bocr\b|what\s+does\s+(?:it|this|that|the\s+(?:image|screenshot|photo|picture))\s+say|"
+    r"text\s+(?:in|from|of|on)\s+(?:it|this|that|the|my)\b|(?:read|type)\s+(?:it|this|that)\s+(?:out|up))",
+    re.IGNORECASE,
+)
+
+TRANSCRIBE_DELIVERY_NOTE = (
+    "[The user asked for the TEXT of the attachment. Put the complete text in your reply, verbatim, "
+    "formatted as it appears (keep line breaks, lists, code and maths as written). The text IS the "
+    "answer: do not reply with only \"Done\" or \"Here it is\", do not summarise it, do not ask where to "
+    "send it. If part of it is unreadable, write what you can and mark the gap.]"
+)
+
+
+def wants_transcription(prompt: str) -> bool:
+    return bool(_TRANSCRIBE_RE.search(prompt or ""))
+
+
+def _transcription_query(user_question: str) -> str:
+    q = (user_question or "").strip()
+    return (
+        "Transcribe ALL of the text in this image exactly as written, from top to bottom, preserving line "
+        "breaks, numbering, bullets, code and mathematical notation (use plain text or LaTeX for maths). "
+        "Do not describe the image, do not summarise, do not add commentary or a preamble: output only the "
+        "transcription. If a word is illegible, write [illegible]."
+        + (f" (The user's request was: {q!r}.)" if q else "")
+    )
+
+
 def _vision_query(user_question: str) -> str:
     """The user's question alone ("change of opinion?") tells a vision model nothing about what to look
     at, and the main model never sees pixels -- only this description. So every image gets a thorough,
     evidence-first description, with the question attached as the thing to answer."""
     q = (user_question or "").strip()
+    if wants_transcription(q):
+        return _transcription_query(q)
     head = "Describe this image thoroughly and extract any text in it."
     if q:
         head += f" The user's message with it was: {q!r}. Answer that too."
@@ -248,7 +283,8 @@ def augment_prompt(prompt: str, conversation, vision_call=None, status_fn=None, 
         if on_saved:
             for att in pending:
                 on_saved(att)
-        return f"{prompt}\n\n{combined}"
+        note = f"\n\n{TRANSCRIBE_DELIVERY_NOTE}" if wants_transcription(prompt) else ""
+        return f"{prompt}\n\n{combined}{note}"
 
     ctx = getattr(conversation, "attachment_context", None)
     if ctx:
@@ -264,11 +300,23 @@ def augment_prompt(prompt: str, conversation, vision_call=None, status_fn=None, 
             block = _combine(block, "[RE-EXAMINATION requested by the user's follow-up]\n" + fresh)
             ctx = [block, turns_left]
             conversation.attachment_context = ctx
+        transcribe = wants_transcription(prompt)
+        if transcribe and vision_call is not None and files:
+            # The warm block is a DESCRIPTION; a request for the text needs the verbatim reading.
+            if status_fn:
+                status_fn("Reading the text off the image, sir...")
+            fresh = build_block(files, prompt[:400], vision_call)
+            block = _combine(block, "[VERBATIM TRANSCRIPTION requested by the user's follow-up]\n" + fresh)
+            ctx = [block, turns_left]
+            conversation.attachment_context = ctx
         if turns_left <= 1:
             conversation.attachment_context = None
             conversation.attachment_files = None
         else:
             conversation.attachment_context = [block, turns_left - 1]
+        if transcribe:
+            return (f"{prompt}\n\n(Earlier attachment(s) still in play for this conversation.)\n{block}\n\n"
+                    f"{TRANSCRIBE_DELIVERY_NOTE}")
         return (f"{prompt}\n\n(Earlier attachment(s) still in play for this conversation. The descriptions below "
                 f"come from a separate vision model, not your own eyes: weigh the user's view against the described "
                 f"evidence instead of defending the first reading for its own sake.)\n{block}")

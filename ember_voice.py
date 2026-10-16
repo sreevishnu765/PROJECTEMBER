@@ -1515,7 +1515,14 @@ class VoiceSession:
                     if kind == "reply" and i == 0:
                         self._note_first_audio()
             except Exception as e:
-                self._log(f"TTS failed for {text[:40]!r}: {e}")
+                # Never silent: a failed synth used to be logged only in debug mode, so a reminder or
+                # reply simply "didn't speak" with no clue why. Always print, and tell the client (at
+                # most once a minute, so a broken engine doesn't spam).
+                print(f"[ember_voice] TTS failed for {text[:40]!r}: {type(e).__name__}: {e}")
+                now = time.time()
+                if now - getattr(self, "_tts_warn_at", 0.0) > 60.0:
+                    self._tts_warn_at = now
+                    self._send({"type": "voice_warning", "text": f"Couldn't speak that aloud ({type(e).__name__}: {e})."})
             finally:
                 with self._lock:
                     self._tts_inflight -= 1

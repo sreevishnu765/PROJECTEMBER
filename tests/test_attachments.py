@@ -169,3 +169,32 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranscriptionRequestTests(unittest.TestCase):
+    def test_detects_text_requests_not_other_image_questions(self):
+        import ember_attachments as a
+        for t in ("convert to text", "convert it to text and display it", "extract the text", "what does it say", "transcribe this"):
+            self.assertTrue(a.wants_transcription(t), t)
+        for t in ("analyze this image", "is this a Ferrari 365?", "change of opinion?", "describe the image"):
+            self.assertFalse(a.wants_transcription(t), t)
+
+    def test_transcription_request_gets_verbatim_query_and_delivery_note(self):
+        import ember_attachments as a
+        self.assertIn("Transcribe ALL", a._vision_query("convert to text"))
+        self.assertNotIn("Transcribe ALL", a._vision_query("what car is this?"))
+        self.assertIn("not reply with only", a.TRANSCRIBE_DELIVERY_NOTE)
+
+    def test_followup_on_warm_image_rereads_verbatim_and_demands_the_text(self):
+        import ember_attachments as a
+        with tempfile.TemporaryDirectory() as d:
+            img = os.path.join(d, "x.png")
+            Path(img).write_bytes(b"\x89PNG fake")
+            conv = SimpleNamespace(attachments=None, attachment_context=["old description", 3],
+                                   attachment_files=[{"kind": "image", "path": img, "name": "x.png", "size": 10}])
+            queries = []
+            out = a.augment_prompt("convert it to text and display it", conv,
+                                   vision_call=lambda raw, mime, q: queries.append(q) or "LINE ONE\nLINE TWO")
+        self.assertTrue(queries and "Transcribe ALL" in queries[0])
+        self.assertIn("LINE ONE", out)
+        self.assertIn("not reply with only", out)

@@ -285,6 +285,15 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
         v = voice if voice is not None else await asyncio.to_thread(_ensure_voice)
         if v is not None:
             v.announce(spoken)
+        else:
+            print(f"[ember_transport] reminder shown but NOT spoken, voice unavailable: {voice_failed_reason}")
+            try:
+                await websocket.send(json.dumps({
+                    "type": "voice_warning",
+                    "text": f"A reminder fired but voice isn't available to speak it ({voice_failed_reason}).",
+                }))
+            except Exception:
+                pass
 
     def _on_reminder_due(event_type, payload):
         asyncio.run_coroutine_threadsafe(_deliver_reminder(payload), loop)
