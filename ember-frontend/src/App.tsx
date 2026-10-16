@@ -9,7 +9,6 @@ import { ConfirmationDialog } from "./components/ConfirmationDialog";
 import { HistoryPanel } from "./components/panels/HistoryPanel";
 import { MemoryPanel } from "./components/panels/MemoryPanel";
 import { SystemsPanel } from "./components/panels/SystemsPanel";
-import { DevicesPanel } from "./components/panels/DevicesPanel";
 import { FilesPanel } from "./components/panels/FilesPanel";
 import { UsagePanel } from "./components/panels/UsagePanel";
 import { SettingsPanel } from "./components/panels/SettingsPanel";
@@ -17,7 +16,7 @@ import { useEmberChat } from "./hooks/useEmberChat";
 import type { HudState } from "./types";
 import { describeConfirmation } from "./lib/confirmText";
 
-export type PanelId = "history" | "memory" | "systems" | "devices" | "files" | "usage" | "settings" | null;
+export type PanelId = "history" | "memory" | "systems" | "files" | "usage" | "settings" | null;
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -225,7 +224,6 @@ export default function App() {
       {activePanel === "history" && <HistoryPanel onClose={closePanel} sendQuery={sendQuery} />}
       {activePanel === "memory" && <MemoryPanel onClose={closePanel} sendQuery={sendQuery} />}
       {activePanel === "systems" && <SystemsPanel onClose={closePanel} sendQuery={sendQuery} />}
-      {activePanel === "devices" && <DevicesPanel onClose={closePanel} />}
       {activePanel === "files" && <FilesPanel onClose={closePanel} sendQuery={sendQuery} />}
       {activePanel === "usage" && <UsagePanel onClose={closePanel} sendQuery={sendQuery} />}
       {activePanel === "settings" && <SettingsPanel onClose={closePanel} onSelectVoice={setVoiceName} />}

@@ -3,7 +3,6 @@ import {
   Folder,
   Gauge,
   History,
-  Laptop2,
   Plus,
   Settings,
   Sparkles,
@@ -26,7 +25,6 @@ const NAV_ITEMS: { id: Exclude<PanelId, null>; label: string; icon: typeof Histo
   { id: "history", label: "Past Conversations", icon: History },
   { id: "memory", label: "Memory", icon: Sparkles },
   { id: "systems", label: "Systems", icon: Cpu },
-  { id: "devices", label: "Devices", icon: Laptop2 },
   { id: "files", label: "Files", icon: Folder },
   { id: "usage", label: "API / Usage", icon: Gauge },
 ];

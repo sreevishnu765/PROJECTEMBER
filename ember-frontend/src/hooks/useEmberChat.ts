@@ -215,6 +215,9 @@ export function useEmberChat() {
             lastEvent: msg.event,
             speaking: msg.event === "stopped" ? false : prev.speaking,
           }));
+          // "Go to sleep" / "thank you" with the HUD open: the server already turned voice mode off;
+          // close the window too. The HUD's visibility handler then restores the pre-HUD state.
+          if (msg.event === "dismiss") void window.emberHud?.close();
           // "Ember, you there?" (regular use): the server already turned voice mode on; open the HUD.
           // Its prior mode is "off", so closing the HUD returns to normal wake-word use. The HUD
           // itself has no timeouts — it stays until it is closed.
@@ -470,6 +473,7 @@ export function useEmberChat() {
     if (!playbackRef.current) playbackRef.current = new VoicePlaybackQueue();
     playbackRef.current.resume();
     sendVoiceControl("speaker", { on: true });
+    sendVoiceControl("hud", { on: true }); // "go to sleep" / "thank you" now dismiss the HUD
     // The HUD user is talking, not looking at the app: let Ember ask for approvals out loud.
     sendVoiceControl("spoken_confirm", { on: true });
 
@@ -492,6 +496,7 @@ export function useEmberChat() {
     if (prior === null) return; // HUD was never entered on this connection
     hudPriorModeRef.current = null;
     sendVoiceControl("speaker", { on: false });
+    sendVoiceControl("hud", { on: false });
     sendVoiceControl("spoken_confirm", { on: false });
     sendVoiceControl("mode", { on: prior });
     if (speakingRef.current) {

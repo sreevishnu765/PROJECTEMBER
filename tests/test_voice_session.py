@@ -632,3 +632,34 @@ class RealModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HudDismissTests(unittest.TestCase):
+    """With the HUD open, "go to sleep" / "thank you" must close the HUD (voice_event "dismiss"), not just
+    turn voice mode off or be sent to the model as a message."""
+
+    def setUp(self):
+        self.r = Rig()
+        self.r.v.handle_control({"action": "mode", "on": True})
+        self.r.v.handle_control({"action": "hud", "on": True})
+
+    def tearDown(self):
+        self.r.close()
+
+    def test_go_to_sleep_dismisses_hud_and_turns_voice_mode_off(self):
+        self.r.say("go to sleep")
+        self.r.wait(lambda: self.r.of("voice_event", event="dismiss"))
+        self.assertFalse(self.r.v._voice_mode)
+        self.assertEqual(self.r.submitted, [])
+
+    def test_thank_you_dismisses_hud_without_reaching_the_model(self):
+        self.r.say("thank you")
+        self.r.wait(lambda: self.r.of("voice_event", event="dismiss"))
+        self.assertFalse(self.r.v._voice_mode)
+        self.assertEqual(self.r.submitted, [])
+
+    def test_without_hud_go_to_sleep_does_not_dismiss(self):
+        self.r.v.handle_control({"action": "hud", "on": False})
+        self.r.say("go to sleep")
+        self.r.wait(lambda: self.r.of("voice_event", event="voice_mode_off"))
+        self.assertEqual(self.r.of("voice_event", event="dismiss"), [])

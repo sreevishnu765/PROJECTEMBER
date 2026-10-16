@@ -77,6 +77,9 @@ Client -> server
   {"type":"voice","action":"mode","on":true|false}     voice mode (HUD toggle)
   {"type":"voice","action":"voice","name":"heart"|"isabella"|"daniel"}
   {"type":"voice","action":"speaker","on":true|false}  speak typed-message replies too
+  {"type":"voice","action":"hud","on":true|false}      the HUD window is open: "go to sleep"/"thank you" then
+                                                       dismiss it (voice_event "dismiss") instead of just
+                                                       turning voice mode off
   {"type":"voice","action":"barge_in","on":true|false} let speech interrupt Ember while she talks.
                                                        Default OFF (half-duplex: mic audio is dropped while she
                                                        speaks). Turn on only with echo cancellation or headphones.
@@ -86,7 +89,7 @@ Client -> server
 Server -> client
   {"type":"voice_state","state":"off|listening|hearing|transcribing|thinking|speaking",
    "listening":bool,"voice_mode":bool,"awake":bool,"speaker":bool,"voice":str}
-  {"type":"voice_event","event":"wake"|"voice_mode_on"|"voice_mode_off"|"stopped"}
+  {"type":"voice_event","event":"wake"|"voice_mode_on"|"voice_mode_off"|"stopped"|"dismiss"}
   {"type":"transcript","text":str,"trigger":"wake"|"voice_mode"|"follow_up"}
         -> the client should append a user message with this text and open
            a pending assistant message, exactly as if the user had typed it;
@@ -1122,6 +1125,7 @@ class VoiceSession:
         self._listening = False
         self._voice_mode = False
         self._speaker_on = False
+        self._hud_mode = False      # the desktop HUD is open (client tells us via the "hud" control)
         self._voice = DEFAULT_VOICE
 
         self._gen = 0
@@ -1210,6 +1214,8 @@ class VoiceSession:
         elif action == "speaker":
             self._speaker_on = bool(msg.get("on"))
             self._refresh_state(force=True)
+        elif action == "hud":
+            self._hud_mode = bool(msg.get("on"))
         elif action == "spoken_confirm":
             self._spoken_confirm = bool(msg.get("on"))
         elif action == "barge_in":
@@ -1875,7 +1881,7 @@ class VoiceSession:
         # while the regular follow-up window is open AND the clip is solid speech, not noise.
         closing_ok = (
             bool(text) and is_closing_phrase(text)
-            and not self._voice_mode and self._clock() < self._awake_until
+            and ((not self._voice_mode and self._clock() < self._awake_until) or self._hud_mode)
             and speech_ratio >= 0.35 and len(full_audio) >= 0.4 * MIC_SAMPLE_RATE
         )
         if not text or (is_stt_garbage(text) and not closing_ok):
@@ -1967,14 +1973,38 @@ class VoiceSession:
         self._say(self.config.ack_phrase)
         self._refresh_state(force=True)
 
+    def _dismiss_hud(self, trigger: str) -> None:
+        """"Go to sleep" / "thank you" while the HUD is open: stop whatever is running, turn voice mode
+        off, and tell the client to close the HUD (it restores the pre-HUD state). No spoken goodbye:
+        the window disappearing is the acknowledgement, and closing it would cut the speech off anyway."""
+        self._log(f"dismiss HUD ({trigger})")
+        if self._is_speaking() or self._turn_active():
+            self.interrupt()
+            if self._turn_active():
+                self._answer_confirmation(False)
+                self._cancel_turn()
+        self.set_voice_mode(False, announce=False)
+        with self._lock:
+            self._awake_until = 0.0
+            self._awake_after_reply = False
+        self._send({"type": "voice_event", "event": "dismiss"})
+
     def _accept_command(self, command: str, trigger: str) -> None:
         vm = parse_voice_mode_command(command)
         if vm is not None:
             self._log(f"voice mode {vm} ({trigger})")
+            if vm == "off" and self._hud_mode:
+                self._dismiss_hud(trigger)
+                return
             self.set_voice_mode(vm == "on", announce=True)
             if vm == "off":
                 with self._lock:
                     self._awake_until = 0.0
+            return
+
+        if self._hud_mode and is_closing_phrase(command):
+            # "thank you" with the HUD up ends the session: the HUD goes away, nothing is sent to the model.
+            self._dismiss_hud(trigger)
             return
 
         if is_closing_phrase(command) and not self._voice_mode:
