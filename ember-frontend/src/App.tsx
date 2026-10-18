@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import emberLogo from "./assets/ember-logo.jpeg";
 import { Sidebar } from "./components/Sidebar";
 import { ChatHeader } from "./components/ChatHeader";
 import { MessageList } from "./components/MessageList";
@@ -41,6 +40,7 @@ export default function App() {
     enterHudMode,
     exitHudMode,
     setVoiceName,
+    setVoiceSpeed,
   } = useEmberChat();
   const [hudOpen, setHudOpen] = useState(false);
 
@@ -182,10 +182,10 @@ export default function App() {
           the one and only way the sidebar opens/closes. */}
       <button
         onClick={() => setSidebarOpen((v) => !v)}
-        className="fixed left-3 top-3 z-50 flex h-9 w-9 items-center justify-center overflow-hidden rounded-xl border border-border bg-surface transition-colors hover:border-borderLight"
+        className="ember-wordmark fixed left-4 top-3 z-50 flex h-9 items-center text-textPrimary transition-opacity hover:opacity-80"
         aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
       >
-        <img src={emberLogo} alt="Ember" className="h-full w-full object-cover" />
+        Ember
       </button>
 
       <Sidebar
@@ -202,7 +202,7 @@ export default function App() {
         <ChatHeader connectionState={connectionState} lastProviderFamily={lastAssistant?.providerFamily ?? null} />
 
         <div className="flex min-h-0 flex-1 flex-col">
-          <MessageList messages={messages} onSuggestion={sendMessage} />
+          <MessageList messages={messages} />
         </div>
 
         <Composer
@@ -226,7 +226,7 @@ export default function App() {
       {activePanel === "systems" && <SystemsPanel onClose={closePanel} sendQuery={sendQuery} />}
       {activePanel === "files" && <FilesPanel onClose={closePanel} sendQuery={sendQuery} />}
       {activePanel === "usage" && <UsagePanel onClose={closePanel} sendQuery={sendQuery} />}
-      {activePanel === "settings" && <SettingsPanel onClose={closePanel} onSelectVoice={setVoiceName} />}
+      {activePanel === "settings" && <SettingsPanel onClose={closePanel} onSelectVoice={setVoiceName} onSelectSpeed={setVoiceSpeed} />}
     </div>
   );
 }

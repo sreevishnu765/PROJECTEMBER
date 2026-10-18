@@ -802,7 +802,13 @@ _CALENDAR_RESCHEDULE_PRONOUN_RE = re.compile(r"^\s*(?:please\s+)?reschedule\s+(?
 # now including recurrence ("remind me every Sunday to update the model")
 # per the next-phase brief's explicit task-system requirements.
 _REMINDER_CANCEL_RE = re.compile(r"\bcancel\s+reminder\s+(\S+)", re.IGNORECASE)
-_REMINDER_CREATE_RE = re.compile(r"\bremind me\s+(?:to\s+)?(.+)", re.IGNORECASE)
+_REMINDER_CREATE_RE = re.compile(
+    # "remind me to X at 4pm" AND "set / add / create / make a reminder for 4pm to X" — both end up in the
+    # same handler, group 1 is everything after the lead-in (the handler finds the time phrase inside it).
+    r"\b(?:remind me|(?:set|add|create|make|schedule)\s+(?:me\s+)?(?:a|an|another|the|my)?\s*reminder)"
+    r"\s+(?:to\s+|for\s+|that\s+)?(.+)",
+    re.IGNORECASE,
+)
 _REMINDER_LIST_RE = re.compile(
     # "show active reminders", "active reminders", "reminders", "list my timers", "what reminders do i have",
     # "do i have any reminders", "how many timers", "when is my wake up reminder" -- all of these used to fall
@@ -1088,7 +1094,7 @@ def _register_builtin_tools() -> None:
             else:
                 return (
                     "I didn't catch when to remind you, sir — try 'remind me to <thing> "
-                    "in 2 hours', '...tonight', '...tomorrow morning', or '...every sunday'."
+                    "at 4pm', '...in 2 hours', '...tonight', '...tomorrow morning', or '...every sunday'."
                 )
         else:
             time_phrase = time_match.group(0)
@@ -1103,12 +1109,12 @@ def _register_builtin_tools() -> None:
             if (existing.message.strip().lower() == reminder_text.strip().lower() and existing.recurrence == recurrence
                     and abs((existing.fire_at - fire_at).total_seconds()) < 90):
                 _remember_reminder(existing)
-                return f"You already have that one set, sir — '{reminder_text}' at {existing.fire_at.strftime('%I:%M %p on %b %d')}. (ID: {existing.id})"
+                return f"You already have that one set, sir — '{reminder_text}' at {existing.fire_at.strftime('%I:%M %p on %b %d').lstrip('0')}."
         reminder = _reminder_store.add(reminder_text, fire_at, recurrence=recurrence)
         _remember_reminder(reminder)
-        when = fire_at.strftime("%I:%M %p on %b %d")
+        when = fire_at.strftime("%I:%M %p on %b %d").lstrip("0")
         recur_note = f" (repeats {recurrence})" if recurrence else ""
-        return f"Reminder set, sir — I'll remind you to {reminder_text} at {when}{recur_note}. (ID: {reminder.id})"
+        return f"Reminder set, sir — I'll remind you to {reminder_text} at {when}{recur_note}."
 
     registry.register("create_reminder", "Creates a one-shot or recurring reminder", _REMINDER_CREATE_RE.pattern, _create_reminder)
 
@@ -1139,7 +1145,7 @@ def _register_builtin_tools() -> None:
         fire_at = datetime.now() + timedelta(seconds=seconds)
         reminder = _reminder_store.add(make_timer_message(duration, label), fire_at)
         _remember_reminder(reminder)
-        return f"Timer set, sir — {duration}{' for ' + label if label else ''}, rings at {fire_at.strftime('%I:%M:%S %p').lstrip('0')}. (ID: {reminder.id})"
+        return f"Timer set, sir — {duration}{' for ' + label if label else ''}, rings at {fire_at.strftime('%I:%M:%S %p').lstrip('0')}."
 
     registry.register("set_timer", "Starts a countdown timer that announces itself by voice", _TIMER_RE, _set_timer)
 
@@ -1637,8 +1643,8 @@ def _unrouted_reminder_reply(message: str) -> "str | None":
         if re.search(r"\balarms?\b", message, re.IGNORECASE):
             return ("I don't do alarms as such, sir, and nothing was set. Say 'remind me at 7am to wake up' "
                     "or 'set a timer for 10 minutes'.")
-        return ("I didn't catch the time, sir, so nothing was set. Try 'remind me in 2 hours to call home' "
-                "or 'set a timer for 10 minutes'.")
+        return ("I didn't catch the time, sir, so nothing was set. Try 'remind me at 4pm to call home', "
+                "'remind me in 2 hours to call home' or 'set a timer for 10 minutes'.")
     if verb in ("edit", "change", "update", "reschedule", "postpone", "move", "snooze"):
         return ("I can't edit a reminder in place yet, sir, and nothing was changed. Cancel it ('cancel the wake up "
                 "reminder') and set it again.")
@@ -1926,12 +1932,41 @@ _REMEMBER_COMMAND_RE = re.compile(r"^\s*remember(?:\s+that)?\s+(.+)", re.IGNOREC
 # trailing form.
 _REMEMBER_TRAILING_RE = re.compile(r"^(.+?),?\s*remember(?:\s+that)?\s*[.!]?\s*$", re.IGNORECASE)
 
-_SELF_FACT_PATTERNS = [
-    r"\bmy name is\b", r"\bi am\b", r"\bi'?m\b", r"\bi work\b", r"\bi live\b",
-    r"\bi like\b", r"\bi prefer\b", r"\bi hate\b", r"\bi dislike\b",
-    r"\bi own\b", r"\bmy birthday\b", r"\bi'?ve got\b", r"\bfyi\b",
+# What counts as a "durable fact about the user" for IMPLICIT storing (no "remember" in the message).
+# The first version searched for "I am" / "I'm" / "I like" ANYWHERE in the message and stored the whole
+# message verbatim, so passing remarks and speech-recognition noise got saved as permanent facts
+# ("I am bored.", "I'm in keyboard but I still can't find it.", "Already the entire shell I'm coming to
+# you."). Now a message is only auto-saved when it OPENS with a recognisably lasting statement about the
+# user -- name, home, job, age, origin, a lasting like/dislike, a favourite -- and is one short
+# statement. Moods, locations of the moment ("I'm in ..."), activities ("I'm going/coming/trying ...")
+# and anything mid-sentence never qualify. Anything else the user wants kept: "remember ...".
+_FACT_LEAD = r"^\s*(?:(?:ok(?:ay)?|so|well|also|and|oh|btw|by the way|fyi|hey|ember)\b[,:\s]*)*"
+_DURABLE_SELF_FACT_PATTERNS = [
+    r"my name is\s+\w+",
+    r"(?:my\s+)?(?:birthday|birthdate|date of birth)\s+is\b",
+    r"my\s+(?:favou?rite\s+\w+(?:\s+\w+)?|nickname|hometown|home town|native language|mother tongue)\s+is\b",
+    r"i\s+live\s+(?:in|at|near|on|with)\b",
+    r"i\s+(?:reside|am based|'m based)\s+(?:in|at|near)\b",
+    r"i\s+work\s+(?:at|as|for|in|on|with|from)\b",
+    r"i\s+(?:study|studied|go to school|went to)\s+\w+",
+    r"i(?:'m|\s+am)\s+(?:from|originally|based|located|living|studying|working)\b",
+    r"i(?:'m|\s+am)\s+\d{1,3}\s+years?\s+old\b",
+    r"i(?:'m|\s+am)\s+(?:a|an)\s+(?!bit\b|little\b|lot\b|tad\b|mess\b|wreck\b|few\b|moment\b)\w+",
+    r"i\s+(?:really\s+)?(?:like|love|prefer|enjoy|hate|dislike)\s+(?!(?:it|that|this|those|these|them|the way|how|when|what|you|your)\b)\w+",
+    r"i\s+own\s+(?:a|an|the|my|\d+|two|three)\b",
 ]
-_SELF_FACT_RE = re.compile("|".join(_SELF_FACT_PATTERNS), re.IGNORECASE)
+_DURABLE_SELF_FACT_RE = re.compile(_FACT_LEAD + r"(?:" + "|".join(_DURABLE_SELF_FACT_PATTERNS) + r")", re.IGNORECASE)
+_MAX_IMPLICIT_FACT_WORDS = 30
+
+
+def _is_durable_self_fact(message: str) -> bool:
+    text = (message or "").strip()
+    if not text or len(text.split()) > _MAX_IMPLICIT_FACT_WORDS:
+        return False
+    if len(re.findall(r"[.!?](?:\s|$)", text)) > 1:      # several sentences: not one clean statement
+        return False
+    return bool(_DURABLE_SELF_FACT_RE.match(text))
+
 
 # Real, reproduced bug: "when's my birthday?" matched \bmy birthday\b and
 # got stored VERBATIM as if it were a stated fact — a question, not a
@@ -2025,7 +2060,7 @@ def extract_memory_candidate(message: str) -> "str | None":
         if candidate and candidate.lower() not in {"remember", "remember that"}:
             return _normalize_relative_dates(candidate)
 
-    if _SELF_FACT_RE.search(message) and not _looks_like_question(message):
+    if _is_durable_self_fact(message) and not _looks_like_question(message):
         return _normalize_relative_dates(message.strip())
 
     return None

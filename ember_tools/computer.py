@@ -75,7 +75,10 @@ def is_path_allowed(path: str) -> bool:
         resolved = Path(path).expanduser().resolve()
     except OSError:
         return False
-    for allowed in _load_allowlist():
+    # The default allowlist entry written on first run is an ABSOLUTE path, so after the project folder is
+    # moved it points at a folder that no longer exists and Ember would lose access to its own project.
+    # The project root is therefore always allowed, wherever it currently lives.
+    for allowed in [*_load_allowlist(), str(_PROJECT_ROOT)]:
         try:
             allowed_resolved = Path(allowed).expanduser().resolve()
         except OSError:

@@ -189,6 +189,7 @@ VOICES = {
     "isabella": VoiceSpec("bf_isabella", "en-gb", 1.0),
     "daniel": VoiceSpec("bm_daniel", "en-gb", 1.0),
 }
+MIN_SPEECH_SPEED, MAX_SPEECH_SPEED = 0.5, 2.0   # hard clamp on the Settings speed control
 DEFAULT_VOICE = os.environ.get("EMBER_VOICE", "daniel").lower()
 if DEFAULT_VOICE not in VOICES:
     DEFAULT_VOICE = "daniel"
@@ -776,15 +777,16 @@ class KokoroTTS:
             self._kokoro = Kokoro(self._model_path, self._voices_path)
         return self._kokoro
 
-    def synthesize(self, text: str, voice_key: str) -> "tuple[np.ndarray, int]":
+    def synthesize(self, text: str, voice_key: str, speed: float = 1.0) -> "tuple[np.ndarray, int]":
         spec = VOICES.get(voice_key) or VOICES[DEFAULT_VOICE]
-        cache_key = (text, voice_key)
+        cache_key = (text, voice_key, round(speed, 2))
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
         with self._lock:
             kokoro = self._load()
-            samples, sr = kokoro.create(text, voice=spec.voice_id, speed=spec.speed, lang=spec.lang)
+            # `speed` is the user's Settings multiplier, applied on top of the voice's own preset.
+            samples, sr = kokoro.create(text, voice=spec.voice_id, speed=spec.speed * speed, lang=spec.lang)
         samples = np.asarray(samples, dtype=np.float32)
         if samples.size and (not np.isfinite(samples).all() or float(np.abs(samples).max()) > 8.0):
             # Observed with the int8 Kokoro build on some onnxruntime versions:
@@ -832,8 +834,8 @@ class PiperTTS:
                   f"(run fetch_voice_models.py --piper for the rest).")
         return installed[0]
 
-    def synthesize(self, text: str, voice_key: str) -> "tuple[np.ndarray, int]":
-        cache_key = (text, voice_key)
+    def synthesize(self, text: str, voice_key: str, speed: float = 1.0) -> "tuple[np.ndarray, int]":
+        cache_key = (text, voice_key, round(speed, 2))
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -845,7 +847,17 @@ class PiperTTS:
                 cfg = model + ".json"
                 self._voices[key] = PiperVoice.load(model, cfg if os.path.exists(cfg) else None)
             voice = self._voices[key]
-            parts = [np.asarray(chunk.audio_float_array, dtype=np.float32) for chunk in voice.synthesize(text)]
+            syn_config = None
+            if abs(speed - 1.0) > 1e-3:
+                # Piper speaks faster with a SMALLER length_scale; scale the voice's own default.
+                try:
+                    from piper import SynthesisConfig
+                    base = float(getattr(getattr(voice, "config", None), "length_scale", 1.0) or 1.0)
+                    syn_config = SynthesisConfig(length_scale=base / speed)
+                except Exception as e:   # older piper without SynthesisConfig: keep the voice's normal pace
+                    print(f"[ember_voice] speech speed unsupported by this piper build: {e}")
+            parts = [np.asarray(chunk.audio_float_array, dtype=np.float32)
+                     for chunk in (voice.synthesize(text, syn_config=syn_config) if syn_config is not None else voice.synthesize(text))]
             sr = int(voice.config.sample_rate)
         samples = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
         peak = float(np.abs(samples).max()) if samples.size else 0.0
@@ -1127,6 +1139,7 @@ class VoiceSession:
         self._speaker_on = False
         self._hud_mode = False      # the desktop HUD is open (client tells us via the "hud" control)
         self._voice = DEFAULT_VOICE
+        self._speech_speed = 1.0           # Settings speed multiplier (1.0 = the voice's own pace)
 
         self._gen = 0
         self._seq = 0
@@ -1211,6 +1224,13 @@ class VoiceSession:
             if name in VOICES:
                 self._voice = name
                 self._refresh_state(force=True)
+        elif action == "speed":
+            try:
+                value = float(msg.get("value"))
+            except (TypeError, ValueError):
+                return
+            if value == value:   # NaN check
+                self._speech_speed = min(MAX_SPEECH_SPEED, max(MIN_SPEECH_SPEED, value))
         elif action == "speaker":
             self._speaker_on = bool(msg.get("on"))
             self._refresh_state(force=True)
@@ -1497,7 +1517,10 @@ class VoiceSession:
                 if gen != self._gen:
                     continue
                 t_synth = time.perf_counter()
-                samples, sr = self._tts.synthesize(text, self._voice)
+                if abs(self._speech_speed - 1.0) > 1e-3:
+                    samples, sr = self._tts.synthesize(text, self._voice, speed=self._speech_speed)
+                else:
+                    samples, sr = self._tts.synthesize(text, self._voice)
                 if samples is None or len(samples) == 0:
                     continue
                 self._note_tts_speed(time.perf_counter() - t_synth, len(samples) / float(sr))

@@ -7,6 +7,7 @@ import { startMicCapture, VoicePlaybackQueue, type MicCapture } from "../lib/voi
 const URL_STORAGE_KEY = "ember.serverUrl";
 const TOKEN_STORAGE_KEY = "ember.token";
 const VOICE_STORAGE_KEY = "ember.voicePreference"; // same key SettingsPanel already writes to
+const VOICE_SPEED_KEY = "ember.voiceSpeed"; // speech-speed multiplier from Settings (1 = normal)
 const AUTO_LISTEN_KEY = "ember.autoListen"; // "0" = user muted the mic; anything else = listen for the wake word on connect
 
 // Mirrors ember_voice.py's own {"type":"voice_state",...} shape. `active`
@@ -81,6 +82,10 @@ export function useEmberChat() {
           const savedVoice = localStorage.getItem(VOICE_STORAGE_KEY);
           if (savedVoice) {
             wsRef.current?.send(JSON.stringify({ type: "voice", action: "voice", name: savedVoice.toLowerCase() }));
+          }
+          const savedSpeed = parseFloat(localStorage.getItem(VOICE_SPEED_KEY) ?? "");
+          if (Number.isFinite(savedSpeed) && savedSpeed !== 1) {
+            wsRef.current?.send(JSON.stringify({ type: "voice", action: "speed", value: savedSpeed }));
           }
           // HUD still open across a reconnect: keep spoken approval on.
           if (hudPriorModeRef.current !== null) {
@@ -507,6 +512,7 @@ export function useEmberChat() {
   }, [sendVoiceControl, cancelGeneration]);
 
   const setVoiceName = useCallback((name: string) => sendVoiceControl("voice", { name: name.toLowerCase() }), [sendVoiceControl]);
+  const setVoiceSpeed = useCallback((value: number) => sendVoiceControl("speed", { value }), [sendVoiceControl]);
   const setSpeakerEnabled = useCallback((on: boolean) => sendVoiceControl("speaker", { on }), [sendVoiceControl]);
 
   /** Stops Ember speaking right now — flushes local playback immediately
@@ -595,6 +601,7 @@ export function useEmberChat() {
     enterHudMode,
     exitHudMode,
     setVoiceName,
+    setVoiceSpeed,
     setSpeakerEnabled,
     stopSpeaking,
   };

@@ -110,24 +110,29 @@ def parse_duration_seconds(text: str) -> "int | None":
     return int(total) if total > 0 else None
 
 
+# A clock time that is unambiguous without a leading word: "4pm", "4 pm", "4:30", "4:30pm", "4 o'clock".
+_CLOCK = (r"(?:\d{1,2}:\d{2}\s*(?:am|pm|a\.m\.|p\.m\.)?"
+          r"|\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.)"
+          r"|\d{1,2}\s+o'?clock)")
+# "at 4" (bare hour allowed after "at" only) — "for 2 people" must never read as a time.
+_AT_CLOCK = r"at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?(?:\s+o'?clock)?"
+# Leading words are part of the match so they are cut out of the reminder text: "for 4pm" -> "4pm".
+_TIME_TAIL = rf"(?:{_AT_CLOCK}|(?:for|by|around|before|at)\s+{_CLOCK}|{_CLOCK})"
+
 TIME_PHRASE_RE = re.compile(
     r"\b(" + _DURATION_PHRASE +
     # Day-word phrases (tomorrow/tonight/this evening/...) can optionally
     # be followed by a specific clock time — "tomorrow at 6 PM", "tonight
-    # at 9" — and both pieces MUST be captured as one match. Before this
-    # fix, "tomorrow" (leftmost) and "at 6 PM" (later in the string)
-    # would each be separate potential matches, and re.search only ever
-    # returns the single leftmost one — so "remind me to submit Alpha
-    # tomorrow at 6 PM" only ever extracted "tomorrow", silently dropping
-    # "at 6 PM" and defaulting to 9am. Confirmed via the exact reminder
-    # example from the next-phase brief itself, not a hypothetical.
+    # at 9" — and both pieces MUST be captured as one match (re.search
+    # only returns the leftmost match, so otherwise the clock time was
+    # silently dropped and the reminder defaulted to 9am).
     r"|(?:tomorrow(?:\s+(?:morning|afternoon|evening))?"
     r"|tonight|this\s+evening|this\s+morning|this\s+afternoon"
     r"|evening|morning|afternoon|noon|midnight)"
-    r"(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?"
-    r"|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?"
-    r"|\d{1,2}:\d{2}\s*(?:am|pm)?"
-    r"|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\b",
+    rf"(?:\s+{_TIME_TAIL})?"
+    # Stand-alone clock times: "at 4pm", "for 4pm", "by 4:30", bare "4pm", "16:00".
+    rf"|{_TIME_TAIL}"
+    r"|\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})(?![\w:])",
     re.IGNORECASE,
 )
 
@@ -243,6 +248,8 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
         base_day = now
         is_explicit_future_day = False
 
+    phrase = phrase.replace("a.m.", "am").replace("p.m.", "pm")
+    phrase = re.sub(r"\b(\d{1,2})\s+o'?clock\b", r"\1:00", phrase)   # "4 o'clock" -> "4:00"
     m = (
         re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", phrase)
         or re.search(r"\b(\d{1,2}):(\d{2})\s*(am|pm)?\b", phrase)
@@ -269,6 +276,15 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
         if hour > 23 or minute > 59:
             return None, f"'{original}' doesn't look like a valid time, sir."
         candidate = base_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if (meridiem is None and not is_explicit_future_day and 1 <= hour <= 12
+                and not m.group(1).startswith("0")):
+            # "at 4" with no am/pm: take whichever 4 comes next (said at 2pm -> 4pm today, not 4am tomorrow).
+            h12 = hour % 12
+            options = []
+            for h in (h12, h12 + 12):
+                c = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+                options.append(c if c > now else c + timedelta(days=1))
+            return min(options), ""
         if candidate <= now and not is_explicit_future_day:
             candidate += timedelta(days=1)  # "at 5pm" said at 6pm means tomorrow, not the past
         return candidate, ""

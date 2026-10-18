@@ -531,3 +531,19 @@ class RegistryPrefixTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AllowlistSurvivesMoveTests(unittest.TestCase):
+    def test_project_root_is_always_allowed_even_if_stored_list_has_a_stale_root(self):
+        import json, tempfile
+        from pathlib import Path
+        from ember_tools import computer
+        with tempfile.TemporaryDirectory() as d:
+            stale = Path(d) / "allowed.json"
+            stale.write_text(json.dumps(["C:\\old\\location\\projectember"]), encoding="utf-8")
+            orig = computer._ALLOWLIST_PATH
+            computer._ALLOWLIST_PATH = stale
+            try:
+                self.assertTrue(computer.is_path_allowed(str(computer._PROJECT_ROOT / "ember_core.py")))
+            finally:
+                computer._ALLOWLIST_PATH = orig

@@ -34,7 +34,9 @@ app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 // Overridable without touching code: create ember-frontend/ember.config.json
 // with either/both fields to point at a real venv interpreter or a backend
 // checked out somewhere else, e.g.:
-//   { "pythonPath": "D:\\VISHNU\\PROJECTEMBER\\.venv\\Scripts\\python.exe" }
+//   { "backendDir": "%DESKTOP%\\projects\\projectember", "pythonPath": "venv\\Scripts\\python.exe" }
+// Values may use %DESKTOP%, %USERPROFILE%, %DOCUMENTS% or a leading ~ so the file never has to hold a
+// machine-specific absolute path; a relative pythonPath is resolved against backendDir.
 const DEFAULT_CONFIG = {
   pythonPath: "python",
   // ember-frontend/ sits directly inside the backend's project root
@@ -43,6 +45,51 @@ const DEFAULT_CONFIG = {
   backendDir: path.join(__dirname, "..", ".."),
   backendEntry: "run_transport.py",
 };
+
+// "%DESKTOP%\\projects\\projectember" -> the real Desktop (OneDrive-redirected or not), "~" -> home, etc.
+function expandPath(value) {
+  if (typeof value !== "string" || !value) return value;
+  const tokens = {
+    DESKTOP: () => app.getPath("desktop"),
+    DOCUMENTS: () => app.getPath("documents"),
+    USERPROFILE: () => app.getPath("home"),
+    HOME: () => app.getPath("home"),
+  };
+  let out = value.replace(/%([A-Za-z]+)%/g, (whole, name) => {
+    const fn = tokens[name.toUpperCase()];
+    if (fn) { try { return fn(); } catch { return whole; } }
+    return process.env[name] ?? whole;
+  });
+  if (out === "~" || out.startsWith("~/") || out.startsWith("~\\")) out = path.join(app.getPath("home"), out.slice(1));
+  return out;
+}
+
+// Turns whatever the config says into usable absolute paths, and self-heals when the project folder has
+// been moved: a stale backendDir (no entry script there any more) falls back to the folder this frontend
+// actually sits in, and a stale/relative pythonPath falls back to the project's own venv.
+function resolveConfig(raw, isPackaged) {
+  const cfg = { ...raw };
+  const here = path.join(__dirname, "..", "..");          // ember-frontend/ sits inside the project root
+  if (cfg.backendDir) cfg.backendDir = path.resolve(expandPath(cfg.backendDir));
+  const hasEntry = (dir) => !!dir && fs.existsSync(path.join(dir, cfg.backendEntry || "run_transport.py"));
+  if (!hasEntry(cfg.backendDir) && !isPackaged && hasEntry(here)) {
+    if (cfg.backendDir) sendBackendLog(`[ember] backendDir ${cfg.backendDir} has no ${cfg.backendEntry}; using ${here} instead.`);
+    cfg.backendDir = here;
+  }
+  if (cfg.pythonPath && cfg.pythonPath !== "python") {
+    let py = expandPath(cfg.pythonPath);
+    if (!path.isAbsolute(py) && cfg.backendDir) py = path.join(cfg.backendDir, py);
+    if (!fs.existsSync(py) && cfg.backendDir) {
+      const found = ["venv", ".venv"].map((v) => path.join(cfg.backendDir, v, "Scripts", "python.exe")).find((p) => fs.existsSync(p));
+      if (found) {
+        sendBackendLog(`[ember] pythonPath ${py} not found; using ${found} instead.`);
+        py = found;
+      }
+    }
+    cfg.pythonPath = py;
+  }
+  return cfg;
+}
 
 function loadConfig() {
   // Packaged: ember.config.json ships as a plain, editable file next to
@@ -63,11 +110,11 @@ function loadConfig() {
       console.error(message);
       sendBackendLog(message); // was console.error-only before — invisible in a packaged app with no attached terminal, exactly the failure mode this needed to surface
     }
-    return defaults;
+    return resolveConfig(defaults, app.isPackaged);
   }
   try {
     const overrides = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return { ...defaults, ...overrides };
+    return resolveConfig({ ...defaults, ...overrides }, app.isPackaged);
   } catch (e) {
     const message = `[ember] couldn't parse ${configPath}, using defaults: ${e}`;
     console.error(message);

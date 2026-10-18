@@ -19,7 +19,7 @@ Protocol (JSON messages over one WebSocket connection):
     {"type": "cancel"}
     {"type": "confirm", "request_id": "...", "approved": true|false}
     {"type": "query", "id": "...", "name": "...", "params": {...}}
-    {"type": "voice", "action": "listen"|"mode"|"voice"|"speaker"|"stop"|"state", ...}
+    {"type": "voice", "action": "listen"|"mode"|"voice"|"speed"|"speaker"|"stop"|"state", ...}
     <binary frame>   mic audio, mono PCM16 @ 16 kHz (only after {"type":"voice","action":"listen","on":true})
   Server -> client:
     {"type": "auth_ok"} / {"type": "auth_failed"}

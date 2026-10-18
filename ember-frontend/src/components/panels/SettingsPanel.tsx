@@ -6,17 +6,36 @@ import { GuidePanel } from "./GuidePanel";
 const VOICES = ["Heart", "Isabella", "Daniel"] as const;
 type VoiceName = (typeof VOICES)[number];
 const VOICE_STORAGE_KEY = "ember.voicePreference";
+const SPEED_STORAGE_KEY = "ember.voiceSpeed";
+const SPEED_MIN = 0.7;
+const SPEED_MAX = 1.5;
+const SPEED_STEP = 0.05;
+
+function loadSpeed(): number {
+  const v = parseFloat(localStorage.getItem(SPEED_STORAGE_KEY) ?? "");
+  return Number.isFinite(v) ? Math.min(SPEED_MAX, Math.max(SPEED_MIN, v)) : 1;
+}
 
 interface SettingsPanelProps {
   onClose: () => void;
   onSelectVoice: (voice: string) => void;
+  onSelectSpeed: (speed: number) => void;
 }
 
-export function SettingsPanel({ onClose, onSelectVoice }: SettingsPanelProps) {
+export function SettingsPanel({ onClose, onSelectVoice, onSelectSpeed }: SettingsPanelProps) {
   const [tab, setTab] = useState<"general" | "guide">("general");
   const [selectedVoice, setSelectedVoice] = useState<VoiceName>(
     () => (localStorage.getItem(VOICE_STORAGE_KEY) as VoiceName) || "Heart",
   );
+
+  const [speed, setSpeed] = useState<number>(loadSpeed);
+
+  const changeSpeed = (value: number) => {
+    const v = Math.round(value * 100) / 100;
+    setSpeed(v);
+    localStorage.setItem(SPEED_STORAGE_KEY, String(v));
+    onSelectSpeed(v);
+  };
 
   const selectVoice = (voice: VoiceName) => {
     setSelectedVoice(voice);
@@ -61,9 +80,39 @@ export function SettingsPanel({ onClose, onSelectVoice }: SettingsPanelProps) {
               </button>
             ))}
           </div>
-          <p className="mt-2 text-[12px] text-textMuted">
-            Speed is preset per voice in code — no speed control by design.
-          </p>
+        </div>
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="text-[11.5px] font-medium uppercase tracking-wide text-textMuted">Speaking speed</h3>
+            <div className="flex items-center gap-2">
+              <span className="text-[12.5px] tabular-nums text-textPrimary">{speed.toFixed(2)}×</span>
+              {speed !== 1 && (
+                <button
+                  onClick={() => changeSpeed(1)}
+                  className="text-[11.5px] text-textMuted transition-colors hover:text-textPrimary"
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+          </div>
+          <input
+            type="range"
+            min={SPEED_MIN}
+            max={SPEED_MAX}
+            step={SPEED_STEP}
+            value={speed}
+            onChange={(e) => changeSpeed(parseFloat(e.target.value))}
+            aria-label="Speaking speed"
+            className="ember-range w-full cursor-pointer"
+            style={{ ["--fill" as string]: `${((speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)) * 100}%` }}
+          />
+          <div className="mt-1.5 flex justify-between text-[11px] text-textMuted">
+            <span>Slower</span>
+            <span>Normal</span>
+            <span>Faster</span>
+          </div>
+          <p className="mt-2 text-[12px] text-textMuted">Applies to the next thing Ember says.</p>
         </div>
       </div>
       )}

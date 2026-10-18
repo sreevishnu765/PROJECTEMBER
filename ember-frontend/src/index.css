@@ -177,3 +177,57 @@ html.hud #root {
 @keyframes hudSpin {
   to { transform: rotate(360deg); }
 }
+
+/* Bundled with the app (src/assets/fonts, SIL OFL) so the wordmark looks the same offline. */
+@font-face {
+  font-family: "Cormorant Garamond";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./assets/fonts/cormorant-garamond-latin-600-normal.woff2") format("woff2");
+}
+
+/* Same face as the wordmark, for display text (e.g. the greeting on a new conversation). */
+.ember-serif {
+  font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif;
+  font-weight: 600;
+  font-style: normal;
+  letter-spacing: 0.01em;
+}
+
+/* "Ember" wordmark (top-left sidebar toggle). */
+.ember-wordmark {
+  font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif;
+  font-weight: 600;
+  font-style: normal;
+  font-size: 30px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+}
+
+/* Settings sliders: orange filled track + round thumb (the native look is hidden by appearance:none). */
+.ember-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 20px;
+  background: transparent;
+}
+.ember-range:focus { outline: none; }
+.ember-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, #E1712F var(--fill, 50%), #242D3B var(--fill, 50%));
+}
+.ember-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 9999px;
+  background: #e9edf2;
+  border: 2px solid #E1712F;
+  transition: transform 0.1s ease;
+}
+.ember-range:hover::-webkit-slider-thumb,
+.ember-range:focus-visible::-webkit-slider-thumb { transform: scale(1.15); }
