@@ -9,6 +9,10 @@ declare global {
       getConnection: () => Promise<{ url: string; token: string }>;
     };
     // Present only in the Electron shell — see electron/preload.cjs.
+    // Always-on-top reminder card (Electron only) — see electron/main.cjs showReminderToast().
+    emberToast?: {
+      show: (toast: { title: string; body: string }) => void;
+    };
     emberHud?: {
       open: () => Promise<boolean>;
       close: () => Promise<boolean>;

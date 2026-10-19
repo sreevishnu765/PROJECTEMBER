@@ -271,6 +271,8 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
             shown, spoken = display_message(payload.get("message", "")), reminder_speech(payload.get("message", ""))
         except Exception:
             shown = spoken = payload.get("message", "")
+        print(f"[ember_transport] reminder due -> {session_id}: {spoken!r}"
+              f"{' (late)' if payload.get('late') else ''}; voice {'ready' if voice is not None else 'starting'}")
         try:
             await websocket.send(json.dumps({
                 "type": "reminder", "id": payload.get("id"), "message": shown, "spoken": spoken,

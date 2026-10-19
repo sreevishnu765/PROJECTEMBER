@@ -34,3 +34,8 @@ contextBridge.exposeInMainWorld("emberHud", {
   onCommand: (cb) => subscribe("hud:command", cb),
   onVisibility: (cb) => subscribe("hud:visibility", cb),
 });
+
+// Reminder card that stays visible above a full-screen app. The main process owns the window.
+contextBridge.exposeInMainWorld("emberToast", {
+  show: (toast) => ipcRenderer.send("toast:show", toast),
+});

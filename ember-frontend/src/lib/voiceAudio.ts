@@ -151,13 +151,29 @@ export class VoicePlaybackQueue {
   /** Browsers suspend a freshly created AudioContext until a user gesture
    * — call this from the same click handler that starts voice listening. */
   resume(): void {
-    if (this.audioContext.state === "suspended") {
+    // "interrupted" is Safari's word for suspended; resume() handles both.
+    if (this.audioContext.state !== "running" && this.audioContext.state !== "closed") {
       this.audioContext.resume().catch(() => {});
     }
   }
 
+  /** Forget everything about the previous connection. Each backend connection starts its own
+   * generation counter, but the "stale chunk" floor set by an earlier connection's flushes lives
+   * here for the life of the window. After a reconnect (sleep/wake, a backend restart) the new
+   * session's low generation numbers were all below that old floor, so every spoken reply and
+   * reminder was silently dropped as "stale". Called on every auth_ok. */
+  reset(): void {
+    this.minGen = 0;
+    this.silenceNow();
+    this.gainNode.gain.setTargetAtTime(1.0, this.audioContext.currentTime, 0.01);
+    this.resume();
+  }
+
   push(base64Pcm16: string, gen: number, sampleRate: number): void {
     if (gen < this.minGen) return; // late chunk from before a flush/interrupt — see Player.push's own min_gen check
+    // A context left suspended (Windows can do this after sleep or an output-device change) would
+    // queue the audio forever without playing it. Nudge it on every chunk; it's a no-op when running.
+    if (this.audioContext.state !== "running") this.resume();
     let bytes: Uint8Array;
     try {
       const binary = atob(base64Pcm16);

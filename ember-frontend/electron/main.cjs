@@ -146,6 +146,8 @@ let backendProcess = null;
 let mainWindow = null;
 let hudWindow = null;
 let lastHudState = null; // cached so a freshly opened HUD renders immediately
+let toastWindow = null;
+let toastTimer = null;
 // Real bug found here: the backend is launched before the window even
 // exists (see app.whenReady() below), so any output it produces in that
 // first instant — including a startup crash, which is exactly the kind
@@ -380,6 +382,88 @@ function closeHud() {
   if (hudWindow && !hudWindow.isDestroyed()) hudWindow.close();
 }
 
+// ---- Reminder card --------------------------------------------------
+// Windows quietly drops ordinary toast notifications while a full-screen app has focus (Focus
+// Assist / "don't disturb when full screen"), which is exactly when a reminder matters. This is a
+// small frameless card drawn above everything instead: top-most, never takes focus (so it can't
+// pull a full-screen video out of full screen), click to dismiss, gone by itself after a few seconds.
+const TOAST_SIZE = { width: 380, height: 96 };
+const TOAST_MS = 12000;
+
+const TOAST_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
+  html,body{margin:0;background:transparent;overflow:hidden;font-family:"Segoe UI",Inter,system-ui,sans-serif}
+  #c{box-sizing:border-box;width:100%;height:100vh;display:flex;gap:12px;align-items:center;padding:14px 16px;
+     background:#0A0D12;color:#F2F4F7;border:1px solid rgba(255,255,255,.14);border-left:4px solid #E1712F;
+     border-radius:10px;cursor:pointer;animation:in .18s ease-out}
+  #t{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#E1712F;margin-bottom:4px}
+  #b{font-size:15px;line-height:1.35;max-height:2.7em;overflow:hidden;overflow-wrap:anywhere}
+  @keyframes in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+</style></head><body><div id="c"><div><div id="t"></div><div id="b"></div></div></div>
+<script>
+  window.__set = (d) => { document.getElementById("t").textContent = d.title; document.getElementById("b").textContent = d.body; };
+  document.getElementById("c").addEventListener("click", () => window.close());
+</script></body></html>`;
+
+function closeReminderToast() {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+  if (toastWindow && !toastWindow.isDestroyed()) toastWindow.close();
+  toastWindow = null;
+}
+
+function showReminderToast(toast) {
+  const title = String((toast && toast.title) || "Reminder").slice(0, 60);
+  const body = String((toast && toast.body) || "").slice(0, 240);
+  if (!body) return;
+  closeReminderToast();
+
+  // The display the pointer is on is the one you're looking at; use its full bounds (not workArea)
+  // so the card sits at the very top even when the taskbar is hidden by a full-screen app.
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const b = display.bounds;
+  const win = new BrowserWindow({
+    width: TOAST_SIZE.width,
+    height: TOAST_SIZE.height,
+    x: b.x + b.width - TOAST_SIZE.width - 24,
+    y: b.y + 24,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    hasShadow: false,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false, // never steal focus: that would knock a full-screen video out of full screen
+    alwaysOnTop: true,
+    title: "Ember reminder",
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  toastWindow = win;
+  win.setAlwaysOnTop(true, "screen-saver");
+  win.on("closed", () => {
+    if (toastWindow === win) toastWindow = null;
+  });
+  win.webContents.on("did-finish-load", async () => {
+    if (win.isDestroyed()) return;
+    try {
+      await win.webContents.executeJavaScript(`window.__set(${JSON.stringify({ title, body })})`);
+    } catch (e) {
+      console.warn("[ember] reminder card text failed:", e && e.message);
+    }
+    if (win.isDestroyed()) return;
+    win.showInactive();
+    win.moveTop();
+  });
+  win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(TOAST_HTML));
+  toastTimer = setTimeout(closeReminderToast, TOAST_MS);
+}
+
 app.whenReady().then(() => {
   const token = getOrCreateToken();
 
@@ -395,6 +479,13 @@ app.whenReady().then(() => {
   ipcMain.handle("hud:close", () => {
     closeHud();
     return true;
+  });
+  ipcMain.on("toast:show", (_event, toast) => {
+    try {
+      showReminderToast(toast);
+    } catch (e) {
+      console.warn("[ember] reminder card failed:", e && e.message);
+    }
   });
   ipcMain.on("hud:state", (_event, state) => {
     lastHudState = state;

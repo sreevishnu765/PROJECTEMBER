@@ -1141,8 +1141,17 @@ class VoiceSession:
         self._voice = DEFAULT_VOICE
         self._speech_speed = 1.0           # Settings speed multiplier (1.0 = the voice's own pace)
 
-        self._gen = 0
+        # Each connection gets its own VoiceSession, and clients drop any audio whose generation is below the
+        # "stale" floor an earlier connection's interrupts raised. Starting at 0 every time meant a reconnect
+        # silenced everything until this counter caught up. Wall-clock seconds always start above any
+        # earlier session's count (it would take an interrupt a second, for hours, to catch up).
+        self._gen = int(time.time())
         self._seq = 0
+        # Announcements (reminders/timers): spoken even over a busy room, never cut off by incidental speech.
+        self._announce_pending = 0
+        self._announce_until = 0.0
+        self._duck_held = 0
+        self._ducker = None
         self._muted = False
         self._speaking_until = 0.0
         self._tts_inflight = 0
@@ -1279,7 +1288,7 @@ class VoiceSession:
 
     # ------------------------------------------------------------------ reply hooks
     def begin_reply(self) -> None:
-        if self._is_speaking():
+        if self._is_speaking() and not self._announcing():
             self._stop_audio()
         with self._lock:
             self._muted = False
@@ -1434,6 +1443,7 @@ class VoiceSession:
         with self._lock:
             self._gen += 1
             gen = self._gen
+            dropped_announcements = 0
             while True:
                 try:
                     item = self._tts_q.get_nowait()
@@ -1441,7 +1451,13 @@ class VoiceSession:
                     break
                 if item is not None:
                     self._tts_inflight -= 1
+                    if item[2] == "announce":
+                        self._announce_pending = max(0, self._announce_pending - 1)
+                        dropped_announcements += 1
             self._speaking_until = 0.0
+            self._announce_until = 0.0
+        for _ in range(dropped_announcements):
+            self._duck_release()
         self._send({"type": "audio_stop", "gen": gen})
 
     def _enqueue_speech(self, text: str, kind: str = "reply") -> None:
@@ -1461,8 +1477,66 @@ class VoiceSession:
     def announce(self, text: str) -> None:
         """Speak an unprompted announcement (a reminder or timer firing). Queued behind anything already
         being said rather than cutting it off, and independent of voice mode / the speaker toggle: a
-        reminder that only speaks when you happened to have voice switched on isn't a reminder."""
-        self._say(text)
+        reminder that only speaks when you happened to have voice switched on isn't a reminder.
+
+        While it plays: other apps are turned down (ember_duck, Windows) so it isn't drowned out by a video,
+        and speech picked up by the mic without a wake word (the same video, say) can't cut it off or
+        duck it. Only an explicit stop or a wake-word command interrupts it."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._log(f"announcement queued: {text[:60]!r}")
+        with self._lock:
+            self._announce_pending += 1
+        self._duck_acquire()
+        self._enqueue_speech(text, "announce")
+
+    def _announcing(self) -> bool:
+        with self._lock:
+            return self._announce_pending > 0 or self._clock() < self._announce_until
+
+    def _get_ducker(self):
+        if self._ducker is None:
+            try:
+                from ember_duck import get_ducker
+                self._ducker = get_ducker()
+            except Exception as e:
+                self._log(f"audio ducking unavailable: {type(e).__name__}: {e}")
+                self._ducker = False
+        return self._ducker or None
+
+    def _duck_acquire(self) -> None:
+        d = self._get_ducker()
+        if d is None:
+            return
+        try:
+            if d.acquire():
+                with self._lock:
+                    self._duck_held += 1
+        except Exception as e:
+            self._log(f"audio ducking failed: {type(e).__name__}: {e}")
+
+    def _duck_release(self) -> None:
+        d = self._get_ducker()
+        if d is None:
+            return
+        with self._lock:
+            if self._duck_held <= 0:
+                return
+            self._duck_held -= 1
+        try:
+            d.release()
+        except Exception as e:
+            self._log(f"audio un-ducking failed: {type(e).__name__}: {e}")
+
+    def _duck_release_after(self, seconds: float) -> None:
+        """Release one duck hold once the announcement has finished playing on the client."""
+        if seconds <= 0.05:
+            self._duck_release()
+            return
+        t = threading.Timer(seconds, self._duck_release)
+        t.daemon = True
+        t.start()
 
     def _note_tts_speed(self, synth_seconds: float, audio_seconds: float) -> None:
         """If synthesis is running slower than playback, every chunk boundary is an
@@ -1513,6 +1587,7 @@ class VoiceSession:
             if item is None:
                 return
             gen, text, kind = item
+            play_seconds = 0.0
             try:
                 if gen != self._gen:
                     continue
@@ -1530,6 +1605,9 @@ class VoiceSession:
                         continue
                     now = self._clock()
                     self._speaking_until = max(now, self._speaking_until) + len(samples) / float(sr)
+                    if kind == "announce":
+                        self._announce_until = max(self._announce_until, self._speaking_until)
+                    play_seconds = max(0.0, self._speaking_until - now)
                 slice_bytes = int(sr) * 2 * AUDIO_SLICE_SECONDS
                 for i in range(0, len(pcm), slice_bytes):
                     with self._lock:
@@ -1543,6 +1621,8 @@ class VoiceSession:
                     })
                     if kind == "reply" and i == 0:
                         self._note_first_audio()
+                if kind == "announce":
+                    self._log(f"announcement spoken: {len(pcm) // 2 / float(sr):.1f}s of audio sent to the client")
             except Exception as e:
                 # Never silent: a failed synth used to be logged only in debug mode, so a reminder or
                 # reply simply "didn't speak" with no clue why. Always print, and tell the client (at
@@ -1555,6 +1635,11 @@ class VoiceSession:
             finally:
                 with self._lock:
                     self._tts_inflight -= 1
+                    if kind == "announce":
+                        self._announce_pending = max(0, self._announce_pending - 1)
+                if kind == "announce":
+                    # +0.6s: the client is still playing the last slice when the last chunk has been sent.
+                    self._duck_release_after(play_seconds + 0.6 if play_seconds > 0 else 0.0)
                 self._refresh_state()
 
     # ------------------------------------------------------------------ internals: listening
@@ -1603,7 +1688,7 @@ class VoiceSession:
                                 self._wake_hits.extend(other_hits)
             for ev in self._segmenter.feed(frame):
                 if ev.kind == "start":
-                    if self.config.barge_in and self._is_speaking() and not self._ducked:
+                    if self.config.barge_in and self._is_speaking() and not self._ducked and not self._announcing():
                         self._ducked = True
                         self._send({"type": "voice_duck", "on": True})
                 elif ev.audio is not None:
@@ -2013,6 +2098,11 @@ class VoiceSession:
         self._send({"type": "voice_event", "event": "dismiss"})
 
     def _accept_command(self, command: str, trigger: str) -> None:
+        if trigger in ("voice_mode", "follow_up") and not is_stop_command(command) and self._announcing():
+            # Always-listening speech with no wake word, heard while a reminder is being read out. With a
+            # race or a video playing that is the video, and acting on it would cut the reminder off.
+            self._log(f"ignored while a reminder is being spoken ({trigger}): {command[:40]!r}")
+            return
         vm = parse_voice_mode_command(command)
         if vm is not None:
             self._log(f"voice mode {vm} ({trigger})")

@@ -8,3 +8,6 @@ piper-tts
 sherpa-onnx
 # optional: the nicer-sounding but slower Kokoro voices (EMBER_TTS=kokoro)
 # kokoro-onnx
+# Windows only: lets a reminder turn OTHER apps (a video, a race stream) down while it is spoken, then
+# puts them back. Optional - without it reminders are still spoken, just not over a quieter room.
+pycaw; sys_platform == "win32"

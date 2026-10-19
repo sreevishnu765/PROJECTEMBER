@@ -76,6 +76,9 @@ export function useEmberChat() {
       switch (msg.type) {
         case "auth_ok": {
           setConnectionState("connected");
+          // New connection = new server-side audio generation counter. Clear the playback queue's
+          // stale-chunk floor from the previous connection or this one's audio is dropped as "stale".
+          playbackRef.current?.reset();
           // A voice picked in Settings previously should actually take
           // effect on this connection, not just sit remembered in
           // localStorage until someone happens to revisit the panel.
@@ -156,7 +159,12 @@ export function useEmberChat() {
           if (!playbackRef.current) playbackRef.current = new VoicePlaybackQueue();
           playbackRef.current.resume();
           try {
-            if ("Notification" in window) {
+            if (window.emberToast) {
+              // Electron: an always-on-top card from the main process. Windows suppresses ordinary
+              // toast notifications while a full-screen app (a browser playing a race, say) has focus;
+              // this window is drawn above it instead.
+              window.emberToast.show({ title: msg.late ? "Reminder (missed)" : "Reminder", body: msg.spoken });
+            } else if ("Notification" in window) {
               const show = () => new Notification("Ember", { body: msg.spoken, silent: true });
               if (Notification.permission === "granted") show();
               else if (Notification.permission !== "denied") void Notification.requestPermission().then((p) => p === "granted" && show());
