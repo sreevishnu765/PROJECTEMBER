@@ -146,7 +146,7 @@ def capture_screenshot(output_path: "str | None" = None) -> "str | None":
 
 def analyze_screenshot(
     vision_call_fn: Callable[[bytes, str, str], str],
-    query: str = "Describe what's on screen and point out anything that looks wrong or worth attention.",
+    query: str = "Describe what's on this screen concisely: which app or page is in front, what it is showing, and anything that looks like an error or needs attention. Ignore any small floating Ember assistant panel or reminder card; it is not part of what the user is looking at.",
 ) -> str:
     """Captures the current screen and analyzes it in one step — this is
     the actual capability behind "Ember, look at this screenshot and tell

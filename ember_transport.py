@@ -309,6 +309,34 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
             await _deliver_reminder({**missed, "late": True})
     missed_task = asyncio.ensure_future(_deliver_missed())
 
+    # ---- Morning briefing: first connection of the day (after 6am) reads out today's schedule ---------
+    async def _deliver_briefing():
+        import ember_briefing
+        await asyncio.sleep(3.0)        # after the client's setup and any missed-reminder replay
+        try:
+            brief = await asyncio.to_thread(ember_briefing.prepare)
+        except Exception as e:
+            print(f"[ember_transport] morning briefing failed: {type(e).__name__}: {e}")
+            return
+        if not brief:
+            return
+        print(f"[ember_transport] morning briefing -> {session_id} (calendar {'ok' if brief['calendar_ok'] else 'unreachable'})")
+        try:
+            await websocket.send(json.dumps({"type": "briefing", "text": brief["text"], "spoken": brief["spoken"]}))
+        except BaseException as e:      # includes cancellation when the client disconnects mid-send
+            print(f"[ember_transport] couldn't deliver briefing to {session_id}: {e!r}")
+            ember_briefing.release()
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            return
+        ember_briefing.mark_done(calendar_ok=brief["calendar_ok"])
+        v = voice if voice is not None else await asyncio.to_thread(_ensure_voice)
+        if v is not None:
+            v.announce(brief["spoken"])
+        else:
+            print(f"[ember_transport] briefing shown but NOT spoken, voice unavailable: {voice_failed_reason}")
+    briefing_task = asyncio.ensure_future(_deliver_briefing())
+
     turn_task: "asyncio.Task | None" = None
     query_registry = get_query_registry()
 
@@ -539,6 +567,7 @@ async def _handle_connection(websocket, process_turn_fn, voice_engines=None, ena
         bus.unsubscribe("confirmation.requested", _on_confirmation_requested)
         bus.unsubscribe("reminder.due", _on_reminder_due)
         missed_task.cancel()
+        briefing_task.cancel()
         _REMINDER_CLIENTS.discard(session_id)
         registry.close(session_id)
 

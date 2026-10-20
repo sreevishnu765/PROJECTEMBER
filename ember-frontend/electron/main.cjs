@@ -356,6 +356,10 @@ function openHud() {
   });
   hudWindow = win;
   win.setAlwaysOnTop(true, "floating");
+  // "What's on my screen?" captures the desktop; the HUD must not be in that picture. On Windows 10 2004+ this
+  // removes the window from every capture (screenshots, recordings, screen share) at the compositor, so what was
+  // BEHIND the HUD is what gets captured. Older Windows builds show it as a black box instead.
+  win.setContentProtection(true);
 
   win.webContents.on("did-finish-load", () => {
     if (lastHudState) win.webContents.send("hud:state", lastHudState);
@@ -446,6 +450,7 @@ function showReminderToast(toast) {
   });
   toastWindow = win;
   win.setAlwaysOnTop(true, "screen-saver");
+  win.setContentProtection(true);   // same reason as the HUD: a reminder card is not part of "my screen"
   win.on("closed", () => {
     if (toastWindow === win) toastWindow = null;
   });

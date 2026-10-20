@@ -49,7 +49,7 @@ import json
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable, Optional
 
 DEFAULT_POLL_SECONDS = 5   # was 20; a 30-second timer must not fire up to 20s late. The check is a local list scan, so this costs nothing.
@@ -119,8 +119,27 @@ _AT_CLOCK = r"at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?(?:\s+o'?clock)?
 # Leading words are part of the match so they are cut out of the reminder text: "for 4pm" -> "4pm".
 _TIME_TAIL = rf"(?:{_AT_CLOCK}|(?:for|by|around|before|at)\s+{_CLOCK}|{_CLOCK})"
 
+# A calendar date in a reminder ("on the 31st of January 2027", "january 31 at 5pm", "at 5pm on 31/01/2027").
+# Mirrors the formats _extract_calendar_date() resolves further down. A bare ordinal ("the 3rd") only counts after
+# on/for/by, so "remind me about the 3rd quarter report" isn't read as a date. A stray "20, 2017" that speech-to-text
+# leaves after a day-first date is swallowed with it (it is ignored when the date is resolved).
+_MONTH_NAMES = (r"(?:january|february|march|april|may|june|july|august|september|october|november|december"
+                r"|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)")
+_ORD_SFX = r"(?:st|nd|rd|th)?"
+_DATE_CORE = (
+    rf"(?:the\s+)?\d{{1,2}}{_ORD_SFX}\s+(?:of\s+)?{_MONTH_NAMES}\b\.?(?:\s*,?\s*\d{{4}}\b|\s+\d{{1,2}}\s*,\s*\d{{4}}\b)?"
+    rf"|{_MONTH_NAMES}\b\.?\s+(?:the\s+)?\d{{1,2}}{_ORD_SFX}\b(?:\s*,?\s*\d{{4}}\b)?"
+    r"|\d{1,2}[/.-]\d{1,2}[/.-]\d{4}\b"
+    r"|\d{4}-\d{2}-\d{2}\b"
+)
+_DATE_PHRASE = (
+    rf"(?:(?:on|for|by)\s+)?(?:{_DATE_CORE})"
+    r"|(?:on|for|by)\s+the\s+\d{1,2}(?:st|nd|rd|th)\b"
+)
+_DATE_WITH_TIME = rf"(?:{_TIME_TAIL}\s+)?(?:{_DATE_PHRASE})(?:\s+{_TIME_TAIL})?"
+
 TIME_PHRASE_RE = re.compile(
-    r"\b(" + _DURATION_PHRASE +
+    r"\b(" + _DATE_WITH_TIME + r"|" + _DURATION_PHRASE +
     # Day-word phrases (tomorrow/tonight/this evening/...) can optionally
     # be followed by a specific clock time — "tomorrow at 6 PM", "tonight
     # at 9" — and both pieces MUST be captured as one match (re.search
@@ -187,6 +206,119 @@ def next_occurrence(current_fire_at: datetime, recurrence: str) -> datetime:
     return current_fire_at
 
 
+# ---- Calendar dates: "31st of January 2027", "January 31, 2027", "31/01/2027", "the 31st" -------------------------
+# parse_natural_time() used to know only clock times and day words (tomorrow / weekday names), so "schedule X for
+# the 31st of January 2027" failed with "I couldn't figure out a time". Dates are resolved here, then the rest of
+# the phrase ("at 5pm") goes through the normal clock-time logic below.
+_MONTHS = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5,
+           "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+           "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12}
+_MONTH_RE = r"(?:" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")"
+_ORD = r"(?:st|nd|rd|th)?"
+# "31st of January" / "31 jan 2027" -- day first. A year only counts when it directly follows the month.
+_DMY_RE = re.compile(rf"\b(?:the\s+)?(\d{{1,2}}){_ORD}\s+(?:of\s+)?({_MONTH_RE})\b\.?(?:\s*,?\s*(\d{{4}})\b)?")
+# "January 31st, 2027" / "jan 31" -- month first.
+_MDY_RE = re.compile(rf"\b({_MONTH_RE})\b\.?\s+(?:the\s+)?(\d{{1,2}}){_ORD}\b(?:\s*,?\s*(\d{{4}})\b)?")
+_NUM_DATE_RE = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\b")          # 31/01/2027 (day first)
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")                         # 2027-01-31
+_ORD_DAY_RE = re.compile(r"\bthe\s+(\d{1,2})(?:st|nd|rd|th)\b")                    # "the 31st"
+
+
+def _next_occurrence_of(month: int, day: int, today: "date") -> "date | None":
+    """Next date on or after `today` with this month/day (skips years where it doesn't exist, e.g. Feb 29)."""
+    for y in range(today.year, today.year + 9):
+        try:
+            d = date(y, month, day)
+        except ValueError:
+            continue
+        if d >= today:
+            return d
+    return None
+
+
+def _pretty_date(d: "date") -> str:
+    return f"{d.day} {d.strftime('%B %Y')}"
+
+
+def _find_calendar_date(phrase: str, now: datetime) -> "tuple[date | None, tuple[int, int] | None, str]":
+    """Finds a calendar date in an already-lowercased phrase. Returns (date, (start, end) span of the date text, error).
+    (None, None, "") means there is no date in it. A year is only trusted right next to the month/day; stray
+    digits elsewhere (a speech-to-text garble like "20, 2017" after the month) are ignored, and the resolved date is
+    always echoed back with its year in the confirmation so a wrong guess is visible. An explicit year that has
+    already passed is refused, with the next real occurrence suggested, rather than creating something in the past."""
+    today = now.date()
+    day = month = year = None
+    span = None
+    m = _DMY_RE.search(phrase)
+    if m:
+        day, month, year = int(m.group(1)), _MONTHS[m.group(2)], (int(m.group(3)) if m.group(3) else None)
+        span = m.span()
+    if span is None:
+        m = _MDY_RE.search(phrase)
+        if m:
+            month, day, year = _MONTHS[m.group(1)], int(m.group(2)), (int(m.group(3)) if m.group(3) else None)
+            span = m.span()
+    if span is None:
+        m = _NUM_DATE_RE.search(phrase)
+        if m:
+            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            span = m.span()
+    if span is None:
+        m = _ISO_DATE_RE.search(phrase)
+        if m:
+            year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            span = m.span()
+    if span is None:
+        m = _ORD_DAY_RE.search(phrase)
+        if m:                                              # "the 31st" -> next month that has a 31st
+            day = int(m.group(1))
+            span = m.span()
+            if not 1 <= day <= 31:
+                return None, None, f"There's no day {day} in a month, sir."
+            y, mo = today.year, today.month
+            for _ in range(14):
+                try:
+                    d = date(y, mo, day)
+                except ValueError:
+                    d = None
+                if d and d >= today:
+                    return d, span, ""
+                mo += 1
+                if mo > 12:
+                    mo, y = 1, y + 1
+            return None, None, f"I couldn't find the next {day}th, sir."
+    if span is None:
+        return None, None, ""
+
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None, None, "That doesn't look like a real date, sir."
+    if year is None:
+        d = _next_occurrence_of(month, day, today)
+        if d is None:
+            return None, None, "That date doesn't exist, sir."
+        return d, span, ""
+    try:
+        d = date(year, month, day)
+    except ValueError:
+        return None, None, f"{day} {date(2000, month, 1).strftime('%B')} {year} isn't a real date, sir."
+    if d < today:
+        nxt = _next_occurrence_of(month, day, today)
+        hint = f" Did you mean {_pretty_date(nxt)}? Say it again with the right year." if nxt else ""
+        return None, None, f"{_pretty_date(d)} has already passed, sir.{hint}"
+    return d, span, ""
+
+
+
+def _extract_calendar_date(phrase: str, now: datetime) -> "tuple[date | None, str, str]":
+    """(date, phrase_with_the_date_removed, error); (None, phrase, "") when there is no date in it."""
+    d, span, err = _find_calendar_date(phrase, now)
+    if err:
+        return None, phrase, err
+    if d is None:
+        return None, phrase, ""
+    return d, phrase[:span[0]] + " " + phrase[span[1]:], ""
+
+
 def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Optional[datetime], str]":
     """
     Best-effort natural-language time parser. Returns (datetime, "") on
@@ -215,11 +347,15 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
         if seconds:
             return now + timedelta(seconds=seconds), ""
 
-    is_day_after_tomorrow = "day after tomorrow" in phrase
+    given_date, phrase, date_error = _extract_calendar_date(phrase, now)
+    if date_error:
+        return None, date_error
+
+    is_day_after_tomorrow = (not given_date) and "day after tomorrow" in phrase
     # Real bug: "day after tomorrow" contains the substring "tomorrow",
     # so the plain tomorrow-check below used to fire for it too — off by
     # one day, always. Checked first so the more specific phrase wins.
-    is_tomorrow = (not is_day_after_tomorrow) and "tomorrow" in phrase
+    is_tomorrow = (not given_date) and (not is_day_after_tomorrow) and "tomorrow" in phrase
 
     # Bare weekday names ("wednesday", "reschedule to friday") were
     # explicitly out of scope before — the module docstring even said so.
@@ -231,9 +367,19 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
     # IS the named day, this means the NEXT occurrence (a week out), not
     # today — "reschedule to wednesday" said on a Wednesday shouldn't
     # silently mean "later today."
-    weekday_index = next((i for i, wd in enumerate(_WEEKDAY_NAMES) if re.search(rf"\b{wd}\b", phrase)), None)
+    weekday_index = (None if given_date else
+                     next((i for i, wd in enumerate(_WEEKDAY_NAMES) if re.search(rf"\b{wd}\b", phrase)), None))
 
-    if weekday_index is not None:
+    def _ok(dt: datetime) -> "tuple[Optional[datetime], str]":
+        """A phrase with an explicit calendar date must land in the future (\"the 19th at 9am\" said at noon on the 19th)."""
+        if given_date and dt <= now:
+            return None, f"{dt.strftime('%I:%M %p on %d %B %Y').lstrip('0')} has already passed, sir — give me a later time or another day."
+        return dt, ""
+
+    if given_date:
+        base_day = datetime.combine(given_date, datetime.min.time())
+        is_explicit_future_day = True
+    elif weekday_index is not None:
         days_ahead = (weekday_index - now.weekday()) % 7
         days_ahead = days_ahead or 7
         base_day = now + timedelta(days=days_ahead)
@@ -287,7 +433,7 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
             return min(options), ""
         if candidate <= now and not is_explicit_future_day:
             candidate += timedelta(days=1)  # "at 5pm" said at 6pm means tomorrow, not the past
-        return candidate, ""
+        return _ok(candidate)
 
     for key in _TIME_OF_DAY_KEYS_ORDERED:
         if key in phrase:
@@ -295,10 +441,10 @@ def parse_natural_time(phrase: str, now: Optional[datetime] = None) -> "tuple[Op
             candidate = base_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if candidate <= now and not is_explicit_future_day:
                 candidate += timedelta(days=1)
-            return candidate, ""
+            return _ok(candidate)
 
     if is_explicit_future_day:
-        return base_day.replace(hour=9, minute=0, second=0, microsecond=0), ""
+        return _ok(base_day.replace(hour=9, minute=0, second=0, microsecond=0))
 
     return None, (
         f"I couldn't figure out a time from '{original}', sir — try something like "
@@ -513,13 +659,19 @@ PRONOUNS = {"it", "that", "this", "that one", "this one", "the last one", "last 
             "the last", "that reminder", "this reminder", "that timer", "this timer", "it please"}
 
 
+def format_when(dt: datetime) -> str:
+    """'04:00 PM on Oct 18' -- with the year added when it isn't this year, so a far-off reminder reads right."""
+    out = dt.strftime("%I:%M %p on %b %d").lstrip("0")
+    return out + (dt.strftime(", %Y") if dt.year != datetime.now().year else "")
+
+
 def reminder_label(r) -> str:
     return display_message(r.message)
 
 
 def describe_reminder(r) -> str:
-    when = r.fire_at.strftime("%I:%M %p").lstrip("0") + (r.fire_at.strftime(", %b %d") if r.fire_at.date() != datetime.now().date() else "")
-    return f"{reminder_label(r)} at {when} [{r.id}]" + (f" (repeats {r.recurrence})" if r.recurrence else "")
+    when = r.fire_at.strftime("%I:%M %p").lstrip("0") + (r.fire_at.strftime(", %b %d") if r.fire_at.date() != datetime.now().date() else "") + (r.fire_at.strftime(", %Y") if r.fire_at.year != datetime.now().year else "")
+    return f"{reminder_label(r)} at {when}" + (f" (repeats {r.recurrence})" if r.recurrence else "")
 
 
 def _words(text: str) -> "list[str]":

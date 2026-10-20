@@ -165,7 +165,7 @@ def add_event(summary: str, start_phrase: str, duration_minutes: int = DEFAULT_E
             "end": {"dateTime": _local_isoformat(end_dt)},
         }
         created = service.events().insert(calendarId="primary", body=event).execute()
-        when = start_dt.strftime("%I:%M %p on %b %d")
+        when = start_dt.strftime("%I:%M %p on %b %d") + (start_dt.strftime(", %Y") if start_dt.year != datetime.now().year else "")
         message = f"Added '{summary}' to your calendar at {when}, sir. {created.get('htmlLink', '')}".strip()
         return message, created.get("id")
     except Exception as e:

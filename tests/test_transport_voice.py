@@ -407,3 +407,34 @@ class ReminderDeliveryTests(TransportCase):
         self.assertEqual([g["spoken"] for g in got], ["Reminder to submit Alpha, sir.", "Your 10 minute timer is up, sir."])
         self.assertEqual(got[1]["message"], "10 minute timer")
         self.assertGreater(audio, 0, "reminder was shown but never spoken")
+
+
+class MorningBriefingDeliveryTests(TransportCase):
+    """The first connection of the day gets the briefing in chat AND spoken, without ever touching the mic."""
+
+    async def test_briefing_is_sent_and_spoken(self):
+        from unittest import mock
+        import ember_briefing
+        brief = {"text": "Good morning, sir.\n\nOn your calendar today:\n- 9:00 AM: Dentist",
+                 "spoken": "Good morning, sir. You have 1 event today. 9 AM, Dentist.", "calendar_ok": True}
+        done = []
+        with mock.patch.object(ember_briefing, "prepare", lambda *a, **k: brief), \
+             mock.patch.object(ember_briefing, "mark_done", lambda *a, **k: done.append(k)):
+            got, audio = None, 0
+            deadline = time.time() + 9
+            while time.time() < deadline and (got is None or audio == 0):
+                try:
+                    raw = await asyncio.wait_for(self.ws.recv(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(raw, bytes):
+                    continue
+                m = json.loads(raw)
+                if m["type"] == "briefing":
+                    got = m
+                elif m["type"] == "audio_chunk":
+                    audio += 1
+        self.assertIsNotNone(got, "briefing never reached the client")
+        self.assertIn("Dentist", got["text"])
+        self.assertGreater(audio, 0, "briefing was shown but never spoken")
+        self.assertEqual(done, [{"calendar_ok": True}])

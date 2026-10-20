@@ -70,6 +70,7 @@ export type ServerMessage =
   | { type: "query_result"; id: string; ok: false; error: string }
   | { type: "error"; message: string }
   | { type: "reminder"; id?: string; message: string; spoken: string; priority?: string; late?: boolean }
+  | { type: "briefing"; text: string; spoken: string }
   // ---- Voice (ember_voice.py / ember_transport.py's voice protocol) ----
   | { type: "audio_chunk"; data: string; gen: number; sample_rate: number }
   | { type: "audio_stop"; gen: number }

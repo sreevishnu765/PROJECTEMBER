@@ -174,6 +174,26 @@ export function useEmberChat() {
           }
           break;
         }
+        case "briefing": {
+          // First start of the day: today's schedule, spoken by the server and kept here in the chat.
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: makeId(),
+              role: "assistant",
+              content: msg.text,
+              statusLine: null,
+              tag: null,
+              providerFamily: null,
+              grounded: false,
+              error: null,
+              pending: false,
+            },
+          ]);
+          if (!playbackRef.current) playbackRef.current = new VoicePlaybackQueue();
+          playbackRef.current.resume();
+          break;
+        }
         case "confirmation_required":
           setPendingConfirmation({
             requestId: msg.request_id,

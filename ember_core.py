@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import llm_client
 from ember_memory import EmberMemory
@@ -31,7 +31,7 @@ from ember_tools import calendar as calendar_tool
 from ember_tools import drive as drive_tool
 from ember_tools import file_ops
 from ember_reminders import (
-    ReminderStore, parse_natural_time, TIME_PHRASE_RE,
+    ReminderStore, parse_natural_time, TIME_PHRASE_RE, format_when,
     parse_recurrence, RECURRENCE_PHRASE_RE, make_timer_message, display_message,
     find_reminders, describe_reminder, all_identical, is_timer_message, PRONOUNS,
 )
@@ -44,6 +44,8 @@ from ember_notifications import NotificationManager
 from ember_runtime import EmberRuntime
 from ember_tools.google_auth_watchdog import GoogleAuthWatchdog
 import ember_intent
+import ember_life
+import ember_profile
 import ember_research
 import ember_attachments
 
@@ -101,6 +103,10 @@ _default_conversation: EmberConversation = _conversation_registry.get_or_create(
 )
 
 _skills = SkillsLoader(os.path.join(_PROJECT_ROOT, "skills"))
+# Dated things the user tells Ember about (trips, exams, practicals...) and their profile file: both plain local
+# files, both put in front of her on every turn -- see ember_life.py / ember_profile.py.
+_life_store = ember_life.LifeStore(os.path.join(_PROJECT_ROOT, "data", "life.json"))
+_profile = ember_profile.Profile(os.path.join(_PROJECT_ROOT, "data", "profile.md"))
 _confirm_gate = ember_confirmation.get_confirmation_gate()
 _reminder_store = ReminderStore(
     path=os.path.join(_PROJECT_ROOT, "data", "reminders.json"),
@@ -184,8 +190,9 @@ where to send it and never merely confirm you did it.
 
 GROUNDING — these outrank the style rules above:
 - Never state a personal fact about the user (where they live, their name,
-  birthday, plans, possessions) unless it appears in the "things you know about
-  the user" section below or the user said it in this conversation. If you do
+  birthday, plans, possessions) unless it appears in the user's profile, the
+  dates-and-plans section, or the "things you know about the user" section below,
+  or the user said it in this conversation. If you do
   not have it, say so in one short line. Never guess, and never invent a source
   such as a "contact card", "profile" or "your calendar" that you were not given.
 - Never claim to have done something (saved, sent, moved, set, checked) unless a
@@ -224,6 +231,16 @@ def build_system_prompt(memory_context: str = "", memory_checked: bool = False) 
     injected as context, not as instructions the model should follow."""
     now = datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")
     prompt = f"{BASE_PERSONA}\n\nCurrent date and time: {now}."
+
+    voice = ember_profile.persona_block()
+    if voice:
+        prompt += f"\n\n{voice}"
+    profile_text = _profile.block()
+    if profile_text:
+        prompt += f"\n\n{profile_text}"
+    plans = ember_life.prompt_block(_life_store)
+    if plans:
+        prompt += f"\n\n{plans}"
 
     rules_addendum = _skills.get_system_prompt_addendum()
     if rules_addendum:
@@ -894,6 +911,23 @@ def _clean_reminder_text(text: str) -> str:
     return t.strip(" ,.;:-")
 
 
+def _google_calendar_configured() -> bool:
+    return os.path.exists(os.path.join(_PROJECT_ROOT, "auth", "token.json"))
+
+
+def _local_plans_on(phrase: str) -> "list[dict]":
+    """Local plans-file events covering the day a calendar-check phrase names ("" / "today" / "friday" / ...)."""
+    phrase = (phrase or "").strip().lower()
+    if phrase in ("", "today"):
+        d = date.today()
+    else:
+        dt, _err = parse_natural_time(phrase)
+        if dt is None:
+            return []
+        d = dt.date()
+    return [e for e in _life_store.all() if date.fromisoformat(e["start"]) <= d <= date.fromisoformat(e.get("end") or e["start"])]
+
+
 def _register_builtin_tools() -> None:
     """Registers every capability Ember currently has into the shared
     tool registry. Called once at import time (see the bottom of this
@@ -1036,7 +1070,7 @@ def _register_builtin_tools() -> None:
             if all_identical(hits):
                 return _cancel_these(hits, note=f" (they were {len(hits)} copies of the same one)")
             _dispatch_context["pending_reminder_choice"] = ([r.id for r in hits], __import__("time").time())
-            return (f"{len(hits)} match, sir: {_list_for_choice(hits)}. Say a number, 'all of them', or the ID.")
+            return (f"{len(hits)} match, sir: {_list_for_choice(hits)}. Say a number or 'all of them'.")
         return _cancel_these(hits)
 
     registry.register("cancel_reminder", "Cancels a reminder or timer by ID, wording, duration, time, or 'it'", _REMINDER_CANCEL_RE.pattern, _cancel_reminder, guard=_cancel_guard)
@@ -1094,7 +1128,7 @@ def _register_builtin_tools() -> None:
             else:
                 return (
                     "I didn't catch when to remind you, sir — try 'remind me to <thing> "
-                    "at 4pm', '...in 2 hours', '...tonight', '...tomorrow morning', or '...every sunday'."
+                    "at 4pm', '...in 2 hours', '...tonight', '...tomorrow morning', '...on the 31st of January', or '...every sunday'."
                 )
         else:
             time_phrase = time_match.group(0)
@@ -1109,10 +1143,10 @@ def _register_builtin_tools() -> None:
             if (existing.message.strip().lower() == reminder_text.strip().lower() and existing.recurrence == recurrence
                     and abs((existing.fire_at - fire_at).total_seconds()) < 90):
                 _remember_reminder(existing)
-                return f"You already have that one set, sir — '{reminder_text}' at {existing.fire_at.strftime('%I:%M %p on %b %d').lstrip('0')}."
+                return f"You already have that one set, sir — '{reminder_text}' at {format_when(existing.fire_at)}."
         reminder = _reminder_store.add(reminder_text, fire_at, recurrence=recurrence)
         _remember_reminder(reminder)
-        when = fire_at.strftime("%I:%M %p on %b %d").lstrip("0")
+        when = format_when(fire_at)
         recur_note = f" (repeats {recurrence})" if recurrence else ""
         return f"Reminder set, sir — I'll remind you to {reminder_text} at {when}{recur_note}."
 
@@ -1155,9 +1189,9 @@ def _register_builtin_tools() -> None:
             return "You've got no active reminders, sir."
         _remember_reminder(reminders[0] if len(reminders) == 1 else None)
         lines = [
-            f"  [{r.id}] {display_message(r.message)} — {r.fire_at.strftime('%I:%M %p on %b %d')}"
+            f"{i}. {display_message(r.message)} — {format_when(r.fire_at)}"
             + (f" (repeats {r.recurrence})" if r.recurrence else "")
-            for r in reminders
+            for i, r in enumerate(reminders, 1)
         ]
         return "Active reminders, sir:\n" + "\n".join(lines)
 
@@ -1273,7 +1307,7 @@ def _register_builtin_tools() -> None:
             return "Couldn't capture the screen, sir — see the console for why."
         result = vision_ocr.analyze_document(
             screenshot_path, vision_call_fn=_gemini_vision_call,
-            query="Describe what's on screen and point out anything that looks wrong or worth attention.",
+            query="Describe what's on this screen concisely: which app or page is in front, what it is showing, and anything that looks like an error or needs attention. Ignore any small floating Ember assistant panel or reminder card; it is not part of what the user is looking at.",
         )
         file_registry.record("upload", "analyzed", screenshot_path, label="Screenshot")
         return result
@@ -1389,6 +1423,14 @@ def _register_builtin_tools() -> None:
         phrase = next((g for g in match.groups() if g), "").strip().strip(".!?")
         phrase = _strip_trailing_address(phrase)
         message, events = calendar_tool.check_schedule_natural(phrase or "today")
+        local = _local_plans_on(phrase)
+        if local:
+            t0 = date.today()
+            lines = "\n".join(f"- {ember_life.describe(e, t0)}" for e in local)
+            message = ("From your plans, sir:\n" + lines if not _google_calendar_configured()
+                       else message + "\n\nFrom your plans:\n" + lines)
+        elif not _google_calendar_configured():
+            message = "Nothing in your plans for that day, sir. (Google Calendar isn't connected.)"
         # Remember the event if exactly one was shown, so a pronoun
         # follow-up ("cancel that") can act on it without repeating its
         # name — real, reproduced gap: without this, "please cancel that"
@@ -1421,7 +1463,20 @@ def _register_builtin_tools() -> None:
         _dispatch_context["last_calendar_event"] = {"event_id": event_id, "summary": summary} if event_id else None
         return message
 
-    registry.register("add_calendar_event", "Adds an event to Google Calendar", _CALENDAR_ADD_RE.pattern, _add_calendar_event)
+    def _calendar_add_guard(match):
+        """"schedule X for the 31st" (a date, no clock time) and anything said while Google Calendar isn't connected
+        belong in the local plans file; only a timed request, or one that says "calendar", goes to Google."""
+        groups = match.groups()
+        when = ((groups[1] if groups[0] else groups[3]) or "").lower()
+        if "calendar" in match.group(0).lower():
+            return True
+        w = ember_life.find_when(when)
+        if w is None or w.error:
+            return True                      # let the calendar tool report what it couldn't understand
+        timed = bool(ember_life._time_in(when)[0] or re.search(r"\bat\s+\d", when))
+        return timed and _google_calendar_configured()
+
+    registry.register("add_calendar_event", "Adds an event to Google Calendar", _CALENDAR_ADD_RE.pattern, _add_calendar_event, guard=_calendar_add_guard)
 
     def _correct_calendar_event(match):
         pending = _dispatch_context.get("last_calendar_event")
@@ -1504,6 +1559,201 @@ def _register_builtin_tools() -> None:
         return result
 
     registry.register("download_drive", "Downloads a file/folder from a Google Drive link", _DRIVE_DOWNLOAD_RE.pattern, _download_drive)
+
+    _register_life_tools(registry)
+
+
+
+_LIFE_NOT = re.compile(r"\b(?:remind\w*|reminders?|timers?|alarms?|calendar|files?|folders?|memory|memories|profile)\b", re.IGNORECASE)
+_LIFE_LIST_RE = (
+    r"^\W*(?:ember\W+)?(?:(?:what(?:'s|\s+is|\s+are)?|show(?:\s+me)?|list|tell\s+me)\s+)?(?:my\s+)?"
+    r"(?:coming\s+up|upcoming(?:\s+\w+)?|plans|countdowns?)(?:\s+(?:this|next)\s+\w+)?\W*$"
+    r"|^\W*what\s+plans\s+do\s+i\s+have\b.*$"
+    r"|^\W*what\s+do\s+i\s+have\s+(?:coming\s+up|this\s+week|this\s+month|next\s+week)\W*$"
+)
+_LIFE_WHEN_RE = (
+    r"\bwhen(?:'s|\s+is|\s+are|\s+do|\s+does|\s+did)\s+(?:my\s+|the\s+|our\s+)?(?P<q>[^?]+?)\s*(?:start|begin|end|happening)?\s*\??\s*$"
+    r"|\bhow\s+(?:many\s+days|long)\s+(?:until|till|to|before|left\s+(?:for|until|till))\s+(?:my\s+|the\s+|our\s+)?(?P<q2>[^?]+?)\s*\??\s*$"
+    r"|\bdays?\s+left\s+(?:for|until|till|to)\s+(?:my\s+|the\s+|our\s+)?(?P<q3>[^?]+?)\s*\??\s*$"
+)
+_LIFE_REMOVE_RE = (
+    r"^\W*(?:please\s+)?(?:ember\W+)?(?:remove|delete|drop|cancel|scrap|forget|take\s+off)\s+(?:the\s+|my\s+)?(?P<q>.+?)"
+    r"(?:\s+(?:from|off)\s+(?:my\s+)?(?:plans|events|dates|countdowns?|life|list))?\W*$"
+)
+_LIFE_MOVE_RE = (
+    r"^\W*(?:please\s+)?(?:ember\W+)?(?:move|push|shift|postpone|delay|prepone|change)\s+(?:the\s+|my\s+)?(?P<q>.+?)"
+    r"\s+(?:to|till|until|for)\s+(?P<when>.+?)\W*$"
+)
+_PROFILE_ADD_RE = (
+    r"^\W*(?:please\s+)?(?:ember\W+)?(?:add|put|save|write|note|record)\s+(?:this\s+)?(?:to|in|into|on)\s+(?:my\s+)?profile\s*[:,\-]?\s*(?P<fact>.+)$"
+    r"|^\W*(?:please\s+)?(?:ember\W+)?(?:add|put|save|write|note|record)\s+(?P<fact2>.+?)\s+(?:to|in|into|on)\s+(?:my\s+)?profile\W*$"
+)
+_PROFILE_SHOW_RE = r"^\W*(?:ember\W+)?(?:show|read|display|open|list|what(?:'s|\s+is)\s+in)\s+(?:me\s+)?(?:my\s+)?profile\W*$"
+_PROFILE_REMOVE_RE = (
+    r"^\W*(?:please\s+)?(?:ember\W+)?(?:remove|delete|drop|take)\s+(?:the\s+|that\s+)?(?P<q>.+?)\s+(?:from|out\s+of|off)\s+(?:my\s+)?profile\W*$"
+)
+
+
+def _register_life_tools(registry) -> None:
+    """Dated plans (ember_life.py) and the profile file (ember_profile.py): capture, list, "when is", remove, move.
+    Registered LAST so the older, more specific tools (reminders, calendar, files, memory) keep first claim; every
+    tool here is also guarded so it only fires when it has something real to act on. Within this group the catch-all
+    "note a plan" tool goes last, so list / when-is / remove / move / profile commands are never mistaken for plans."""
+
+    def today():
+        return datetime.now().date()
+
+    # ---- listing
+    def _list(m):
+        t = today()
+        low = m.group(0).lower()
+        days = 7 if re.search(r"this week|next week|coming week", low) else 31 if "this month" in low else 90
+        evs = _life_store.upcoming(t, days)
+        kw = re.search(r"upcoming\s+(\w+)", low)
+        label = ""
+        if kw and kw.group(1) not in ("plans", "events", "dates", "things", "stuff", "this", "next"):
+            from ember_memory import content_tokens
+            q = content_tokens(kw.group(1))
+            if q:
+                evs = [e for e in evs if q <= content_tokens(e["title"])]
+                label = kw.group(1)
+        span = "this week" if days == 7 else "this month" if days == 31 else "in the next 90 days"
+        if not evs:
+            return f"No {label or 'plans'} in your plans file {span}, sir." if label else f"Nothing in your plans file {span}, sir."
+        return (f"Upcoming {label}, sir:\n" if label else "Coming up, sir:\n") + "\n".join(f"{i}. {ember_life.describe(e, t)}" for i, e in enumerate(evs, 1))
+
+    registry.register("list_life_events", "Lists upcoming dated plans from the plans file", _LIFE_LIST_RE, _list,
+                      guard=lambda m: len(m.group(0).split()) <= 10)
+
+    # ---- "when is my trip" / "how many days until my practical"
+    def _when_query(m):
+        d = m.groupdict()
+        return (d.get("q") or d.get("q2") or d.get("q3") or "").strip()
+
+    def _when_guard(m):
+        q = _when_query(m)
+        return bool(q) and not _LIFE_NOT.search(q) and bool(_life_store.find(q, today()))
+
+    def _when(m):
+        t = today()
+        evs = _life_store.find(_when_query(m), t)[:3]
+        return "\n".join(f"{ember_life.describe(e, t)}, sir." for e in evs)
+
+    registry.register("when_is_life_event", "Answers 'when is my X' / 'how many days until X' from the plans file",
+                      _LIFE_WHEN_RE, _when, guard=_when_guard)
+
+    # ---- removing
+    def _remove_matches(m):
+        q = (m.group("q") or "").strip()
+        if not q or _LIFE_NOT.search(q):
+            return []
+        return _life_store.find(q, today(), include_past=True)
+
+    def _remove_ambiguous(m):
+        t = today()
+        hits = _remove_matches(m)
+        return (f"{len(hits)} plans match that, sir, and I won't guess:\n"
+                + "\n".join(f"{i}. {ember_life.describe(e, t)}" for i, e in enumerate(hits, 1))
+                + "\nSay a bit more of the title for the one you mean.")
+
+    registry.register("remove_life_event_ambiguous", "Refuses to guess when a removal matches several plans",
+                      _LIFE_REMOVE_RE, _remove_ambiguous, guard=lambda m: len(_remove_matches(m)) >= 2)
+
+    def _remove(m):
+        hits = _remove_matches(m)
+        if len(hits) != 1:
+            return "That no longer matches exactly one plan, sir, so I've left everything as it was."
+        ev = hits[0]
+        _life_store.remove(ev["id"])
+        return f"Removed, sir — {ember_life.describe(ev, today())}."
+
+    registry.register("remove_life_event", "Removes a dated plan from the plans file — confirmed first", _LIFE_REMOVE_RE,
+                      _remove, destructive=True, guard=lambda m: len(_remove_matches(m)) == 1)
+
+    # ---- moving
+    def _move_parts(m):
+        q, when = (m.group("q") or "").strip(), (m.group("when") or "").strip()
+        if not q or _LIFE_NOT.search(q + " " + when):
+            return None
+        hits = _life_store.find(q, today())
+        if len(hits) != 1:
+            return None
+        w = ember_life.find_when(when.lower())
+        return (hits[0], w) if w else None
+
+    def _move(m):
+        got = _move_parts(m)
+        if not got:
+            return "I couldn't work out what to move, sir."
+        ev, w = got
+        if w.error:
+            return w.error
+        t = today()
+        before = ember_life.describe(ev, t)
+        end = w.end
+        if end is None and ev.get("end") and ev["end"] != ev["start"]:     # moving a multi-day plan keeps its length
+            end = w.start + (date.fromisoformat(ev["end"]) - date.fromisoformat(ev["start"]))
+        new = _life_store.move(ev["id"], w.start, end, w.time)
+        return f"Moved, sir — {before} is now {ember_life.describe(new, t)}." if new else "Couldn't find that plan any more, sir."
+
+    registry.register("move_life_event", "Moves a dated plan to a new date", _LIFE_MOVE_RE, _move, guard=lambda m: _move_parts(m) is not None)
+
+    # ---- profile
+    def _profile_add(m):
+        ok, msg = _profile.add(m.group("fact") or m.group("fact2") or "")
+        return f"Added to your profile, sir: {msg}" if ok else msg
+
+    registry.register("profile_add", "Adds a lasting fact to the always-on profile file", _PROFILE_ADD_RE, _profile_add)
+
+    def _profile_show(m):
+        lines = _profile.lines()
+        return "Your profile, sir:\n" + "\n".join(lines) if lines else (
+            "Your profile is empty, sir. Say 'add to my profile: …' and I'll keep it in front of me from then on.")
+
+    registry.register("profile_show", "Shows the profile file", _PROFILE_SHOW_RE, _profile_show)
+
+    def _profile_hits(m):
+        return _profile.find((m.group("q") or "").strip())
+
+    def _profile_remove_ambiguous(m):
+        hits = _profile_hits(m)
+        if not hits:
+            return "Nothing in your profile matches that, sir."
+        return "Several lines match, sir — say a bit more:\n" + "\n".join(hits)
+
+    registry.register("profile_remove_ambiguous", "Refuses to guess which profile line to remove", _PROFILE_REMOVE_RE,
+                      _profile_remove_ambiguous, guard=lambda m: len(_profile_hits(m)) != 1)
+
+    def _profile_remove(m):
+        hits = _profile_hits(m)
+        if len(hits) != 1 or not _profile.remove(hits[0]):
+            return "That no longer matches exactly one line, sir, so I've left your profile alone."
+        return f"Removed from your profile, sir: {hits[0].lstrip('- ')}"
+
+    registry.register("profile_remove", "Removes one line from the profile file — confirmed first", _PROFILE_REMOVE_RE,
+                      _profile_remove, destructive=True, guard=lambda m: len(_profile_hits(m)) == 1)
+
+    # ---- noting a plan, from a command or a plain statement
+    def _capture_guard(m):
+        return ember_life.capture(m.group(0)) is not None
+
+    def _note(m):
+        cap = ember_life.capture(m.group(0))
+        if cap is None:
+            return "I couldn't make sense of that date, sir."
+        if cap.error:
+            return cap.error
+        t = today()
+        ev, action, before = _life_store.add_or_update(cap.title, cap.start, cap.end, cap.time, t)
+        line = ember_life.describe(ev, t)
+        if action == "unchanged":
+            return f"I already have that, sir — {line}."
+        if action == "updated":
+            return f"Updated, sir — {ember_life.describe(before, t)} is now {line}."
+        return f"Noted, sir — {line}."
+
+    registry.register("note_life_event", "Notes a dated plan (trip, exam, practical...) from a statement or 'add X on <date>'",
+                      r"^[\s\S]{3,400}$", _note, guard=_capture_guard)
 
 
 # Registered once at import time — see the module docstring above and

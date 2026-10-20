@@ -17,8 +17,25 @@ def route(msg):
 
 
 class TextCommandClaims(unittest.TestCase):
+    def setUp(self):
+        # the guide's calendar examples describe Google Calendar being connected; without it they are kept locally
+        from unittest import mock
+        p = mock.patch.object(c, "_google_calendar_configured", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
+
     CASES = {
         "remind me to submit the report tomorrow at 6 PM": "create_reminder",
+        "I have a trip in 5 days": "note_life_event",
+        "my physics practical is on 3rd November": "note_life_event",
+        "sem exams from the 12th to the 24th of December": "note_life_event",
+        "add scooty service on the 31st": "note_life_event",
+        "schedule a part change for the 31st of January 2027": "note_life_event",
+        "what's coming up?": "list_life_events",
+        "what are my plans": "list_life_events",
+        "upcoming exams": "list_life_events",
+        "add to my profile: I'm in 5th semester, mechanical": "profile_add",
+        "show my profile": "profile_show",
         "remind me in 2 hours to call home": "create_reminder",
         "remind me every Sunday to review the week": "create_reminder",
         "set a timer for 10 minutes": "set_timer",
