@@ -126,7 +126,8 @@ def build_briefing(events: "list[dict]", reminders: list, now: datetime, plans_t
         shown.append(note)
         spoken.append(note)
     if len(shown) == 1:
-        txt = f"{greeting} Nothing on your plans or reminders today, and nothing in the coming week."
+        txt = (f"{greeting} Nothing on your plans or reminders today, and nothing in the coming week." if SOON_DAYS >= 7
+               else f"{greeting} Nothing on your plans or reminders today.")
         return txt, txt
     return "\n\n".join(shown), " ".join(spoken)
 
@@ -150,7 +151,9 @@ def _default_google_configured() -> bool:
     return os.path.exists(os.path.join(_PROJECT_ROOT, "auth", "token.json"))
 
 
-SOON_DAYS = 7
+# Days ahead the briefing mentions plans for. Default 0: only what is dated today -- a plan three days out is
+# said on its day, not repeated every morning. EMBER_BRIEFING_LOOKAHEAD_DAYS=7 brings the "Coming up" lines back.
+SOON_DAYS = int(os.environ.get("EMBER_BRIEFING_LOOKAHEAD_DAYS", "0") or 0)
 
 
 def prepare(now: Optional[datetime] = None, state_path: str = STATE_PATH, fetch: Optional[Callable] = None,

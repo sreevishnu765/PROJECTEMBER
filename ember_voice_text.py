@@ -612,6 +612,30 @@ def is_stop_command(text: str) -> bool:
     return bool(_STOP_RE.match(_normalize(text)))
 
 
+_STOP_FILLERS = {"now", "it", "that", "this", "please", "sir", "ember", "talking", "already", "right", "all"}
+_STOP_PHRASES = ("stop talking", "be quiet", "shut up", "that's enough", "stop", "quiet", "enough", "cancel")
+
+
+def is_stop_like(text: str, max_words: int = 6) -> bool:
+    """Looser than is_stop_command, for use ONLY while Ember is speaking or working: a short utterance that
+    starts or ends with a stop phrase (\"shut up\", \"Ember stop it now\", \"...the race shut up\"). Her own
+    voice leaking into the mic pads a real \"stop\" with extra words, so the full-string anchor misses it. Capped
+    at max_words so a long sentence that merely contains the word never counts, and a bare wake word / ember alias
+    is ignored when counting."""
+    toks = _normalize(text).split()
+    while toks and (toks[0] in _CONFIRM_WAKE_LEAD or ember_like(toks[0])):
+        toks = toks[1:]
+    if not toks or len(toks) > max_words:
+        return False
+    s = " ".join(toks).replace("thats", "that's")
+    for p in _STOP_PHRASES:
+        if s == p or s.endswith(" " + p):              # \"...<her words> shut up\": padding BEFORE the phrase is echo
+            return True
+        if s.startswith(p + " ") and set(s[len(p):].split()) <= _STOP_FILLERS:   # \"stop it now\", never \"stop the music\"
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 3b. Spoken confirmation (yes / no) for destructive actions
 # ---------------------------------------------------------------------------
@@ -677,6 +701,8 @@ def confirmation_prompt(tool_name: str, args: "dict | None" = None) -> str:
         ask = "Wipe everything I remember"
     elif name == "forget_memory":
         ask = "Forget that"
+    elif name == "shutdown_laptop":
+        ask = "Shut the laptop down"
     elif name.startswith("cancel_calendar"):
         ask = "Cancel that calendar event"
     else:

@@ -129,7 +129,7 @@ import numpy as np
 
 from ember_voice_text import (
     is_closing_phrase, is_presence_check, parse_confirmation_reply,
-    SentenceChunker, detect_wake, is_stop_command, is_stt_garbage,
+    SentenceChunker, detect_wake, is_stop_command, is_stop_like, is_stt_garbage,
     looks_like_echo, name_aliases, parse_voice_mode_command, soft_wake_vetoed, strip_wake_residue,
 )
 
@@ -462,8 +462,12 @@ KWS_KEYWORDS = {                                                      # BPE piec
     # slower transcribe-a-short-burst path) instead of building a keyword file sherpa_onnx would
     # abort on. If it's still wrong, that log line will say exactly which piece to fix next.
     "stop": "\u2581ST O P",
+    # Pieces taken from the model's own bpe.model (SentencePiece encode of "SHUT UP"), and every piece checked
+    # against its tokens.txt -- unlike the guesses above. Same instant, no-transcription path as "stop".
+    "shut_up": "\u2581S H U T \u2581UP",
 }
-KWS_STRONG = ("hey_ember", "stop")   # trusted anywhere in an utterance
+KWS_STOP_NAMES = ("stop", "shut_up")   # acoustic interrupts: act the instant they fire, never count as wake hits
+KWS_STRONG = ("hey_ember", "stop", "shut_up")   # trusted anywhere in an utterance
 KWS_FILES = {
     "tokens": "tokens.txt",
     "encoder": "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
@@ -1678,11 +1682,11 @@ class VoiceSession:
                 # not deaf (see below) — only "stop" gets checked while deaf.
                 hits = self._wake.accept(frame)
                 if hits:
-                    stop_hits = [h for h in hits if h[1] == "stop"]
+                    stop_hits = [h for h in hits if h[1] in KWS_STOP_NAMES]
                     if stop_hits:
                         self._handle_acoustic_stop()
                     if not deaf:
-                        other_hits = [h for h in hits if h[1] != "stop"]
+                        other_hits = [h for h in hits if h[1] not in KWS_STOP_NAMES]
                         if other_hits:
                             with self._wake_lock:
                                 self._wake_hits.extend(other_hits)
@@ -2001,6 +2005,19 @@ class VoiceSession:
             recent = [t for ts, t in self._recent_spoken if now - ts < 60.0]
             voice_mode = self._voice_mode
             awake = voice_mode or now < self._awake_until
+        # A stop said over Ember's own voice rarely transcribes as the bare phrase: the mic still carries some of her
+        # speech, so Whisper returns her words plus "shut up" (or the echo check below throws it away as echo). While
+        # she is busy, a SHORT utterance that starts or ends with a stop phrase is a stop. Checked before the echo
+        # drop and not gated by the speaker lock -- a stray interrupt is cheap and instantly recoverable.
+        if self._confirm_pending is None and (self._is_speaking() or self._turn_active()):
+            if is_stop_like(text):
+                self._log(f"stop (heard over her speech): {text!r}")
+                self.interrupt()
+                if self._turn_active():
+                    self._cancel_turn()
+                self._send({"type": "voice_event", "event": "stopped"})
+                return
+            self._log(f"heard while she was speaking, not a stop: {text!r}")
         if looks_like_echo(text, recent):
             self._report(text, "dropped (echo of own speech)")
             return

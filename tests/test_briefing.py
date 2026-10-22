@@ -92,7 +92,8 @@ def test_google_not_connected_is_silent(tmp_path):
     assert not called and not brief["google_failed"] and "Google" not in brief["text"]
 
 
-def test_local_plans_today_and_coming_up(tmp_path):
+def test_local_plans_today_and_coming_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(b, "SOON_DAYS", 7)
     st = str(tmp_path / "s.json")
     now = datetime(2026, 10, 21, 7, 0)
     plans = [{"id": "a", "title": "Physics practical", "start": "2026-10-21", "end": None, "time": None},
@@ -113,3 +114,17 @@ def test_no_events_is_a_real_empty_day(tmp_path):
 def test_switch_off(monkeypatch, tmp_path):
     monkeypatch.setenv("EMBER_BRIEFING", "0")
     assert b.prepare(datetime(2026, 10, 21, 7, 0), str(tmp_path / "s.json"), ok_fetch, lambda: [], lambda: [], lambda: True) is None
+
+
+def test_default_briefing_leaves_a_plan_for_its_own_day(tmp_path):
+    st = str(tmp_path / "s.json")
+    plans = [{"id": "b", "title": "Booking of tickets", "start": "2026-10-24", "end": None, "time": None}]
+    brief = b.prepare(datetime(2026, 10, 21, 7, 0), st, ok_fetch, lambda: [], lambda: plans, lambda: False)
+    assert "Booking" not in brief["text"] and "Coming up" not in brief["spoken"]
+
+
+def test_default_briefing_says_the_plan_on_the_day(tmp_path):
+    st = str(tmp_path / "s.json")
+    plans = [{"id": "b", "title": "Booking of tickets", "start": "2026-10-24", "end": None, "time": None}]
+    brief = b.prepare(datetime(2026, 10, 24, 7, 0), st, ok_fetch, lambda: [], lambda: plans, lambda: False)
+    assert "Booking of tickets, today." in brief["spoken"]

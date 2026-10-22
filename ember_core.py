@@ -30,10 +30,12 @@ from ember_tools import spotify as spotify_tool
 from ember_tools import calendar as calendar_tool
 from ember_tools import drive as drive_tool
 from ember_tools import file_ops
+from ember_tools import power as power_tools
 from ember_reminders import (
     ReminderStore, parse_natural_time, TIME_PHRASE_RE, format_when,
     parse_recurrence, RECURRENCE_PHRASE_RE, make_timer_message, display_message,
     find_reminders, describe_reminder, all_identical, is_timer_message, PRONOUNS,
+    parse_duration_seconds, _DURATION_PHRASE,
 )
 from ember_files import FileRegistry
 from ember_history import ConversationHistory
@@ -955,6 +957,65 @@ def _register_builtin_tools() -> None:
         return f"Forgot {len(deleted)} matching memory(ies), sir:\n{lines}"
 
     registry.register("forget_memory", "Deletes memories matching a text query", _FORGET_SPECIFIC_RE.pattern, _forget_specific, destructive=True)
+
+    # ---- Laptop power: shut down / cancel the shutdown ------------------------------------------------
+    # Registered ahead of the reminder tools on purpose (first match wins), so "cancel the shutdown" is never
+    # read as a reminder cancel. The shutdown itself is destructive=True: confirmation first, then a 30 s
+    # Windows countdown that "cancel the shutdown" (or `shutdown /a`) stops. See ember_tools/power.py.
+    _PC_OBJ = r"(?:the\s+|this\s+|my\s+)?(?:laptop|computer|pc|machine)"
+    _PC_NOT_PART = r"(?!\s*(?:'s|screen|monitor|display|speakers?|volume|sound|mic|microphone|wi-?fi|bluetooth|keyboard|backlight|fan|camera))"
+    _SHUTDOWN_RE = (rf"(?:\b(?:shut\s*down|power\s*off|power\s+down|turn\s+off|switch\s+off)\s+{_PC_OBJ}\b{_PC_NOT_PART}"
+                    rf"|\bshut\s+{_PC_OBJ}\s+down\b)"
+                    rf"(?:\s+(?P<delay>{_DURATION_PHRASE}))?")
+    # Anything that makes it a question, a reminder or a note instead of a command.
+    _SHUTDOWN_VETO_RE = re.compile(
+        r"\b(?:remind|reminder|timer|schedule|calendar|note)\b|^\s*(?:how|what|why|when|where|which|is|does|do|did|should)\b"
+        r"|\b(?:how\s+(?:do|can|to)|what\s+happens|if\s+i|when\s+i)\b", re.IGNORECASE)
+    # Clock times / conditions we cannot honour yet ("at 11pm", "tonight", "after the race"): say so, do nothing.
+    _SHUTDOWN_LATER_RE = re.compile(
+        r"\bat\s+\d|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b(?:tonight|tomorrow|later|noon|midnight|o'?clock)\b"
+        r"|\bthis\s+(?:evening|morning|afternoon)\b|\b(?:after|when|until|once|before)\b", re.IGNORECASE)
+
+    def _shutdown_wanted(m) -> bool:
+        text = m.string
+        return not _SHUTDOWN_VETO_RE.search(text) and not _SHUTDOWN_LATER_RE.search(text)
+
+    def _shutdown_later_wanted(m) -> bool:
+        text = m.string
+        return not _SHUTDOWN_VETO_RE.search(text) and bool(_SHUTDOWN_LATER_RE.search(text))
+
+    def _shutdown_laptop(match):
+        delay = parse_duration_seconds(match.group("delay") or "") if match.group("delay") else None
+        return power_tools.schedule_shutdown(delay, active_reminders=len(_reminder_store.list_active()))
+
+    def _shutdown_later(match):
+        return ("I can shut the laptop down now or after a delay — 'in 30 minutes' — sir, but not at a clock time or "
+                "after an event yet. Nothing was scheduled.")
+
+    registry.register("shutdown_later_unsupported", "Declines a clock-time/conditional shutdown honestly",
+                      _SHUTDOWN_RE, _shutdown_later, guard=_shutdown_later_wanted)
+    registry.register("shutdown_laptop", "Shuts the laptop down after a 30 s cancellable countdown — confirmed first",
+                      _SHUTDOWN_RE, _shutdown_laptop, destructive=True, guard=_shutdown_wanted)
+    # "Hey Ember, terminate" / "terminate in 10 minutes": the user's own word for the same shutdown, deliberately
+    # WITHOUT a confirmation question -- the cancellable Windows countdown is the safety net. Whole-utterance
+    # only, so "terminate the script" or "terminate that process" never matches.
+    _TERMINATE_RE = (rf"^\s*(?:(?:hey\s+)?ember\s*[,.!:]?\s+)?(?:please\s+)?terminate(?:\s+(?:now|please))?"
+                     rf"(?:\s+(?P<delay>{_DURATION_PHRASE}))?(?:\s*[,.]?\s*(?:ember|sir|please))?[\s.!?]*$")
+
+    def _terminate(match):
+        delay = parse_duration_seconds(match.group("delay")) if match.group("delay") else None
+        return power_tools.schedule_shutdown(delay, active_reminders=len(_reminder_store.list_active()))
+
+    registry.register("terminate_laptop", "Shuts the laptop down on the single word 'terminate' (no confirmation; 30 s cancellable countdown)",
+                      _TERMINATE_RE, _terminate)
+    # "Lights out": sleep, not shut down. Whole-utterance only; no confirmation (sleep loses nothing).
+    _LIGHTS_OUT_RE = r"^\s*(?:(?:hey\s+)?ember\s*[,.!:]?\s+)?(?:please\s+)?lights?\s+out(?:\s+please)?(?:\s*[,.]?\s*(?:ember|sir))?[\s.!?]*$"
+    registry.register("lights_out", "Puts the PC to sleep (not shut down) on 'lights out'",
+                      _LIGHTS_OUT_RE, lambda m: power_tools.sleep_now(active_reminders=len(_reminder_store.list_active())))
+    registry.register("cancel_shutdown", "Cancels a pending laptop shutdown",
+                      r"\b(?:cancel|abort|stop|undo|never\s*mind|don'?t)\s+(?:the\s+|that\s+|my\s+)?(?:(?:laptop|computer|pc)\s+)?"
+                      r"(?:shut\s*down|shutting\s+down|power(?:ing)?\s*(?:off|down))\b",
+                      lambda m: power_tools.cancel_shutdown())
 
     # ---- Speech vocabulary (see ember_stt_adapt.py) ------------------------
     # "when you hear max will stop I mean Verstappen" / "add Verstappen to your vocabulary".
