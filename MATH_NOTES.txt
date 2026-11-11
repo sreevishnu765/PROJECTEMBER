@@ -1,0 +1,10 @@
+EMBER MATH-RENDERING PATCH, 2026-11-09 (frontend only; base: your push 5744521)
+Extract INTO the project folder (the one containing ember-frontend\), choose Replace. Then:
+
+  cd ember-frontend
+  npm install            (adds katex, remark-math, rehype-katex)
+  npm run electron:build (or npm run electron:dev while developing)
+
+Changed: ember-frontend\package.json, package-lock.json, src\index.css,
+         src\components\MessageBubble.tsx, src\hud\HudApp.tsx
+New:     ember-frontend\src\components\Markdown.tsx, src\lib\math.ts

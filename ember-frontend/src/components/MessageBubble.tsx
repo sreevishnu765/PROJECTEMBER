@@ -1,5 +1,4 @@
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { Markdown } from "./Markdown";
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, Check, Copy, Loader2 } from "lucide-react";
 import type { ChatMessage } from "../types";
@@ -80,7 +79,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
 
       {message.content && (
         <div className="ember-prose max-w-none">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+          <Markdown>{message.content}</Markdown>
         </div>
       )}
 

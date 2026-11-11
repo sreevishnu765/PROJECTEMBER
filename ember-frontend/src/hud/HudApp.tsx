@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { Markdown } from "../components/Markdown";
 import { ArrowUp, Contrast, Square, X } from "lucide-react";
 import type { HudState, HudTurn } from "../types";
 
@@ -110,7 +109,7 @@ function TurnCard({ turn }: { turn: HudTurn }) {
           turn.content
         ) : (
           <div className="ember-prose hud-prose !text-[13.5px] !leading-relaxed !text-inherit">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.content}</ReactMarkdown>
+            <Markdown>{turn.content}</Markdown>
           </div>
         )}
 
